@@ -17,10 +17,11 @@ export const FILTERS = [
  * @param {number[][]} [o.corners] มุมเดิม (ถ้าไม่ส่ง จะหาขอบอัตโนมัติ)
  * @param {string} o.filter
  * @param {number} [o.rotation]
+ * @param {number} [o.contrast] 0..1
  * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
- * @returns {Promise<{corners, filter, rotation}|null>}
+ * @returns {Promise<{corners, filter, rotation, contrast, cont}|null>} cont = กด "บันทึก + ถ่ายต่อ"
  */
-export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }) {
+export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0.5, onContinue }) {
   const dlg = document.createElement('dialog');
   dlg.className = 'editor';
   dlg.setAttribute('aria-label', 'ปรับภาพเอกสาร');
@@ -54,6 +55,11 @@ export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }
       <div class="ed-filters">
         ${FILTERS.map((f) => `<button type="button" class="chip" data-filter="${f.id}">${esc(f.label)}</button>`).join('')}
       </div>
+      <div class="ed-contrast">
+        <label for="ed-contrast">คอนทราสต์</label>
+        <input type="range" id="ed-contrast" min="0" max="100" step="1" value="${Math.round(contrast * 100)}">
+        <output class="ed-contrast-val">${Math.round(contrast * 100)}</output>
+      </div>
       <footer class="ed-tools">
         <button type="button" class="tool" data-act="rotL">${icon('rotL')}<span>หมุนซ้าย</span></button>
         <button type="button" class="tool" data-act="rotR">${icon('rotR')}<span>หมุนขวา</span></button>
@@ -75,6 +81,7 @@ export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }
     corners: corners ? corners.map((p) => [...p]) : FULL_FRAME.map((p) => [...p]),
     filter,
     rotation,
+    contrast,
   };
 
   // ภาพสำหรับแสดงบนจอ (ย่อให้พอดีจอ เพื่อความลื่น)
@@ -189,6 +196,7 @@ export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }
     const token = ++previewToken;
     previewBox.classList.add('loading');
     dlg.querySelectorAll('[data-filter]').forEach((b) => b.classList.toggle('active', b.dataset.filter === state.filter));
+    dlg.querySelector('.ed-contrast').hidden = state.filter === 'original';
     try {
       if (!previewSrc) previewSrc = scaleCanvas(canvas, 1400);
       const out = await processCanvas(previewSrc, state);
@@ -234,8 +242,16 @@ export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }
       else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); setStatus(''); }
       else if (act === 'rotL') { state.rotation = (state.rotation + 270) % 360; renderPreview(); }
       else if (act === 'rotR') { state.rotation = (state.rotation + 90) % 360; renderPreview(); }
-      else if (act === 'save') finish({ ...state });
-      else if (act === 'saveMore') { onContinue(); finish({ ...state }); }
+      else if (act === 'save') finish({ ...state, cont: false });
+      else if (act === 'saveMore') { onContinue(); finish({ ...state, cont: true }); }
+    });
+    // ลากแถบคอนทราสต์: รอให้หยุดลากสักนิดค่อยคำนวณพรีวิวใหม่
+    let contrastTimer;
+    dlg.querySelector('#ed-contrast').addEventListener('input', (e) => {
+      state.contrast = Number(e.target.value) / 100;
+      dlg.querySelector('.ed-contrast-val').textContent = e.target.value;
+      clearTimeout(contrastTimer);
+      contrastTimer = setTimeout(renderPreview, 140);
     });
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
     dlg.addEventListener('close', () => finish(null));

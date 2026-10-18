@@ -92,9 +92,9 @@ export async function detectCorners(canvas) {
 }
 
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, filter, rotation }) {
+export async function processCanvas(canvas, { corners, filter, rotation, contrast = 0.5 }) {
   const image = imagePayload(canvas);
-  const r = await call('process', { image, corners: isFullFrame(corners) ? null : corners, filter, rotation }, [image.data]);
+  const r = await call('process', { image, corners: isFullFrame(corners) ? null : corners, filter, rotation, contrast }, [image.data]);
   const out = document.createElement('canvas');
   out.width = r.w;
   out.height = r.h;

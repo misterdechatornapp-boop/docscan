@@ -5,10 +5,11 @@ import { $, esc, modal, sheet, confirmBox, promptBox, toast, withBusy, progress,
 import { loadCanvas, toBlob, freeCanvas, scaleCanvas, detectCorners, processCanvas, warmup, FULL_FRAME, THUMB_SIDE } from './imaging.js';
 import { openEditor, FILTERS } from './editor.js';
 import { buildPdf, buildJpgs, canShareFiles, shareFiles, downloadFiles, QUALITIES } from './exporter.js';
+import { openCameraView, cameraSupported } from './camera.js';
 import Sortable from '../vendor/sortable.esm.js';
 import { VERSION, APP_NAME, TRASH_DAYS } from './config.js';
 
-const DEFAULT_SETTINGS = { filter: 'color', pageSize: 'a4', quality: 'medium', format: 'pdf' };
+const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, camera: 'app', pageSize: 'a4', quality: 'medium', format: 'pdf' };
 let settings = { ...DEFAULT_SETTINGS };
 
 const app = $('#app');
@@ -46,6 +47,7 @@ let searchQuery = '';
 async function route() {
   const r = parseRoute();
   releaseUrls();
+  if (r.view !== 'doc') selection = null;
   sortable?.destroy();
   sortable = null;
   try {
@@ -99,7 +101,7 @@ async function buildPage(docId, srcCanvas, opts, existing) {
   freeCanvas(out);
   freeCanvas(thumbCanvas);
   const page = existing || { id: db.uid(), docId, createdAt: Date.now(), original: await toBlob(srcCanvas, 0.9) };
-  Object.assign(page, { processed, thumb, corners: opts.corners, filter: opts.filter, rotation: opts.rotation || 0 });
+  Object.assign(page, { processed, thumb, corners: opts.corners, filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5 });
   await db.put('pages', page);
   return page;
 }
@@ -123,11 +125,51 @@ function requestPersist() {
 let camTarget = null;
 let galTarget = null;
 
-function openCamera(docId) {
-  warmup().catch(() => {});
-  camTarget = { docId: docId || null, folderId: currentFolderId() };
+/** กล้องของระบบ (ภาพคมสุด แต่คุมไฟฉายไม่ได้) — ต้องเรียกในจังหวะแตะ */
+function openSystemCamera(target) {
+  camTarget = target;
   camInput.value = '';
   camInput.click();
+}
+
+/** กล้องในแอป (ไฟฉาย + กรอบสด) ถ้าใช้ไม่ได้จะใช้กล้องของระบบแทน */
+async function openCamera(docId) {
+  warmup().catch(() => {});
+  const target = { docId: docId || db.uid(), folderId: currentFolderId() };
+  if (settings.camera === 'system' || !cameraSupported()) return openSystemCamera(target);
+  let saved = 0;
+  const res = await openCameraView({
+    onSystemCamera: () => openSystemCamera(target),
+    onShot: async (canvas) => {
+      const r = await openEditor({ canvas, filter: settings.filter, contrast: settings.contrast, onContinue: () => {} });
+      if (!r) { freeCanvas(canvas); return 'cancel'; }
+      rememberLook(r);
+      saved++;
+      enqueue(async () => {
+        const page = await buildPage(target.docId, canvas, r);
+        await appendPages(target.docId, [page], target.folderId);
+      }).catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message)).finally(() => freeCanvas(canvas));
+      return r.cont ? 'saved' : 'done';
+    },
+  });
+  if (res.error) {
+    toast('เปิดกล้องในแอปไม่ได้ · ใช้กล้องของระบบแทน', { ms: 3500 });
+    console.warn(res.error);
+    return;
+  }
+  if (!saved) return;
+  const prog = progress('กำลังบันทึก…');
+  await queue;
+  prog.close();
+  if (parseRoute().view === 'doc' && parseRoute().docId === target.docId) route();
+  else go(`#/doc/${target.docId}`);
+}
+
+/** จำฟิลเตอร์/คอนทราสต์ล่าสุดไว้ใช้กับภาพถัดไป */
+function rememberLook(r) {
+  if (settings.filter === r.filter && settings.contrast === r.contrast) return;
+  Object.assign(settings, { filter: r.filter, contrast: r.contrast });
+  db.setMeta('settings', settings);
 }
 
 function openGallery(docId) {
@@ -160,12 +202,14 @@ async function editAndSave(file, target, fromCamera) {
   const res = await openEditor({
     canvas,
     filter: settings.filter,
-    onContinue: fromCamera ? () => openCamera(docId) : null,
+    contrast: settings.contrast,
+    onContinue: fromCamera ? () => openSystemCamera({ docId, folderId: target?.folderId }) : null,
   });
   if (!res) {
     freeCanvas(canvas);
     return;
   }
+  rememberLook(res);
   toast('กำลังบันทึก…', { ms: 0 });
   try {
     await enqueue(async () => {
@@ -193,7 +237,7 @@ async function importMany(files, target) {
       try {
         const c = await loadCanvas(files[i]);
         const corners = (await detectCorners(c)) || FULL_FRAME;
-        const page = await enqueue(() => buildPage(docId, c, { corners, filter: settings.filter, rotation: 0 }));
+        const page = await enqueue(() => buildPage(docId, c, { corners, filter: settings.filter, contrast: settings.contrast, rotation: 0 }));
         freeCanvas(c);
         await enqueue(() => appendPages(docId, [page], target?.folderId));
       } catch (err) {
@@ -356,14 +400,16 @@ async function folderMenu(folder, preset) {
   route();
 }
 
-async function docMenu(doc) {
+async function docMenu(doc, inDoc = false) {
   const act = await sheet(doc.name, [
+    ...(inDoc && doc.pageIds.length ? [{ id: 'select', label: 'เลือกหน้า', icon: 'select' }] : []),
     { id: 'export', label: 'ส่งออก / แชร์', icon: 'share' },
     { id: 'rename', label: 'เปลี่ยนชื่อเอกสาร', icon: 'pencil' },
     { id: 'move', label: 'ย้ายไปโฟลเดอร์', icon: 'move' },
     { id: 'delete', label: 'ลบ', icon: 'trash', danger: true },
   ]);
   if (act === 'export') return openExport(doc);
+  if (act === 'select') { selection = { docId: doc.id, ids: new Set() }; return route(); }
   if (act === 'rename') await renameDoc(doc);
   else if (act === 'move') await moveDoc(doc);
   else if (act === 'delete') {
@@ -406,69 +452,147 @@ async function deleteDoc(doc) {
 }
 
 /* ---------- หน้าเอกสาร (หลายหน้า) ---------- */
+// โหมดเลือกหน้า: { docId, ids: Set } หรือ null
+let selection = null;
+const LONG_PRESS_MS = 550;
+
 async function renderDoc(docId) {
   const doc = await db.get('docs', docId);
   if (!doc || doc.deletedAt) return go('#/');
   const pages = await db.pagesOf(doc);
   const back = doc.folderId ? `#/folder/${doc.folderId}` : '#/';
+  if (selection && selection.docId !== docId) selection = null;
+  const sel = selection;
+  if (sel) [...sel.ids].forEach((id) => { if (!doc.pageIds.includes(id)) sel.ids.delete(id); });
+  const n = sel?.ids.size || 0;
+
+  const header = sel
+    ? `<button class="icon-btn" data-act="sel-cancel" aria-label="เลิกเลือก">${icon('close')}</button>
+       <h1>เลือก ${n} หน้า</h1>
+       <button class="btn btn-ghost" data-act="sel-all">${n === pages.length ? 'ไม่เลือกเลย' : 'เลือกทั้งหมด'}</button>`
+    : `<button class="icon-btn" data-act="back" aria-label="กลับ">${icon('back')}</button>
+       <h1><button class="title-btn" data-act="rename">${esc(doc.name)}</button></h1>
+       <button class="icon-btn" data-act="menu" aria-label="เมนู">${icon('more')}</button>`;
+  const hint = sel
+    ? '<p class="hint">แตะหน้าเพื่อเลือกหรือเลิกเลือก</p>'
+    : pages.length > 1 ? '<p class="hint">แตะค้างเพื่อเลือกหน้า · แตะค้างแล้วลากเพื่อเรียงลำดับ</p>' : '';
+  const footer = sel
+    ? `<footer class="bottombar sel-bar">
+        <button class="bar-btn" data-act="sel-export" ${n ? '' : 'disabled'}>${icon('share')}<span>ส่งออก ${n} หน้า</span></button>
+        <span class="bar-spacer"></span>
+        <button class="bar-btn danger" data-act="sel-delete" ${n ? '' : 'disabled'}>${icon('trash')}<span>ลบ ${n} หน้า</span></button>
+      </footer>`
+    : `<footer class="bottombar">
+        <button class="bar-btn" data-act="gallery">${icon('image')}<span>รูปภาพ</span></button>
+        <button class="shutter" data-act="camera" aria-label="ถ่ายเพิ่ม">${icon('camera')}</button>
+        <button class="bar-btn" data-act="export" ${pages.length ? '' : 'disabled'}>${icon('share')}<span>ส่งออก</span></button>
+      </footer>`;
 
   app.innerHTML = `
-    <header class="topbar">
-      <button class="icon-btn" data-act="back" aria-label="กลับ">${icon('back')}</button>
-      <h1><button class="title-btn" data-act="rename">${esc(doc.name)}</button></h1>
-      <button class="icon-btn" data-act="menu" aria-label="เมนู">${icon('more')}</button>
-    </header>
+    <header class="topbar">${header}</header>
     <main class="scroll">
-      ${pages.length > 1 ? '<p class="hint">แตะค้างแล้วลากเพื่อเรียงลำดับหน้า</p>' : ''}
-      <div class="grid" id="grid">
-        ${pages.map((p, i) => `
-          <button class="page-card" data-id="${p.id}" data-act="open-page" aria-label="หน้า ${i + 1}">
+      ${hint}
+      <div class="grid ${sel ? 'select-mode' : ''}" id="grid">
+        ${pages.map((p, i) => {
+          const on = sel?.ids.has(p.id);
+          return `
+          <button class="page-card ${on ? 'selected' : ''}" data-id="${p.id}" data-act="open-page" aria-label="หน้า ${i + 1}" ${sel ? `aria-pressed="${!!on}"` : ''}>
             <img src="${blobUrl(p.thumb)}" alt="" draggable="false">
             <span class="page-no">${i + 1}</span>
-          </button>`).join('')}
+            ${sel ? `<span class="page-check">${icon('check')}</span>` : ''}
+          </button>`;
+        }).join('')}
       </div>
       ${!pages.length ? '<div class="empty"><div>เอกสารนี้ยังไม่มีหน้า</div><div class="muted">ถ่ายหรือเลือกรูปเพื่อเพิ่มหน้า</div></div>' : ''}
     </main>
-    <footer class="bottombar">
-      <button class="bar-btn" data-act="gallery">${icon('image')}<span>รูปภาพ</span></button>
-      <button class="shutter" data-act="camera" aria-label="ถ่ายเพิ่ม">${icon('camera')}</button>
-      <button class="bar-btn" data-act="export" ${pages.length ? '' : 'disabled'}>${icon('share')}<span>ส่งออก</span></button>
-    </footer>`;
+    ${footer}`;
 
   const grid = $('#grid');
-  if (pages.length > 1) {
-    sortable = new Sortable(grid, {
-      animation: 160,
-      delay: 220,
-      delayOnTouchOnly: true,
-      forceFallback: true, // ใช้ระบบลากของ Sortable เองทั้งนิ้วและเมาส์ ให้พฤติกรรมเหมือนกันทุกเครื่อง
-      fallbackTolerance: 4,
-      ghostClass: 'drag-ghost',
-      chosenClass: 'drag-chosen',
-      onEnd: async (e) => {
-        if (e.oldIndex === e.newIndex) return;
-        const ids = [...grid.children].map((el) => el.dataset.id);
-        grid.querySelectorAll('.page-no').forEach((el, i) => { el.textContent = i + 1; });
-        const fresh = await db.get('docs', docId);
-        fresh.pageIds = ids;
-        await refreshDoc(fresh);
-      },
+  let suppressClick = false;
+
+  if (!sel) {
+    // แตะค้างโดยไม่ขยับนิ้ว = เข้าโหมดเลือก (ถ้าขยับระหว่างค้าง = ลากเรียงหน้า)
+    let pressTimer;
+    let startXY = null;
+    if (pages.length > 1) {
+      sortable = new Sortable(grid, {
+        animation: 160,
+        delay: 220,
+        delayOnTouchOnly: true,
+        forceFallback: true, // ใช้ระบบลากของ Sortable เองทั้งนิ้วและเมาส์ ให้พฤติกรรมเหมือนกันทุกเครื่อง
+        fallbackTolerance: 4,
+        ghostClass: 'drag-ghost',
+        chosenClass: 'drag-chosen',
+        onStart: () => clearTimeout(pressTimer),
+        onEnd: async (e) => {
+          if (e.oldIndex === e.newIndex) return;
+          const ids = [...grid.children].map((el) => el.dataset.id);
+          grid.querySelectorAll('.page-no').forEach((el, i) => { el.textContent = i + 1; });
+          const fresh = await db.get('docs', docId);
+          fresh.pageIds = ids;
+          await refreshDoc(fresh);
+        },
+      });
+    }
+    grid.addEventListener('pointerdown', (e) => {
+      const card = e.target.closest('.page-card');
+      if (!card || e.button !== 0) return;
+      startXY = [e.clientX, e.clientY];
+      clearTimeout(pressTimer);
+      pressTimer = setTimeout(() => {
+        suppressClick = true;
+        selection = { docId, ids: new Set([card.dataset.id]) };
+        route();
+      }, LONG_PRESS_MS);
     });
+    grid.addEventListener('pointermove', (e) => {
+      if (startXY && Math.hypot(e.clientX - startXY[0], e.clientY - startXY[1]) > 8) clearTimeout(pressTimer);
+    });
+    const cancelPress = () => { clearTimeout(pressTimer); startXY = null; };
+    grid.addEventListener('pointerup', cancelPress);
+    grid.addEventListener('pointercancel', cancelPress);
   }
 
   app.onclick = async (e) => {
     const t = e.target.closest('[data-act]');
     if (!t) return;
     const act = t.dataset.act;
+    if (suppressClick) {
+      suppressClick = false;
+      if (act === 'open-page') return;
+    }
     if (act === 'back') go(back);
     else if (act === 'rename') { await renameDoc(doc); route(); }
-    else if (act === 'menu') docMenu(doc);
+    else if (act === 'menu') docMenu(doc, true);
     else if (act === 'camera') openCamera(docId);
     else if (act === 'gallery') openGallery(docId);
     else if (act === 'export') openExport(doc);
     else if (act === 'open-page') {
-      const i = [...grid.children].indexOf(t);
-      go(`#/doc/${docId}/page/${i}`);
+      if (sel) {
+        const id = t.dataset.id;
+        if (sel.ids.has(id)) sel.ids.delete(id);
+        else sel.ids.add(id);
+        route();
+      } else {
+        go(`#/doc/${docId}/page/${[...grid.children].indexOf(t)}`);
+      }
+    } else if (act === 'sel-cancel') {
+      selection = null;
+      route();
+    } else if (act === 'sel-all') {
+      selection.ids = n === pages.length ? new Set() : new Set(doc.pageIds);
+      route();
+    } else if (act === 'sel-export') {
+      openExport(doc, [...sel.ids]);
+    } else if (act === 'sel-delete') {
+      const ok = await confirmBox(`ลบ ${n} หน้าที่เลือก?`, 'ลบแล้วกู้คืนไม่ได้', { ok: `ลบ ${n} หน้า`, danger: true });
+      if (!ok) return;
+      for (const id of sel.ids) await db.del('pages', id);
+      doc.pageIds = doc.pageIds.filter((id) => !sel.ids.has(id));
+      await refreshDoc(doc);
+      selection = null;
+      toast(`ลบ ${n} หน้าแล้ว`);
+      route();
     }
   };
 }
@@ -523,7 +647,7 @@ async function renderPage(docId, index) {
     else if (act === 'rotate') {
       await withBusy(t, async () => {
         const c = await loadCanvas(page.original);
-        await buildPage(docId, c, { corners: page.corners, filter: page.filter, rotation: ((page.rotation || 0) + 90) % 360 }, page);
+        await buildPage(docId, c, { corners: page.corners, filter: page.filter, contrast: page.contrast ?? 0.5, rotation: ((page.rotation || 0) + 90) % 360 }, page);
         freeCanvas(c);
         await refreshDoc(doc);
       });
@@ -547,7 +671,7 @@ async function renderPage(docId, index) {
 
 async function reEditPage(doc, page) {
   const canvas = await loadCanvas(page.original);
-  const res = await openEditor({ canvas, corners: page.corners, filter: page.filter, rotation: page.rotation });
+  const res = await openEditor({ canvas, corners: page.corners, filter: page.filter, rotation: page.rotation, contrast: page.contrast ?? 0.5 });
   if (res) {
     const prog = progress('กำลังบันทึก…');
     try {
@@ -622,14 +746,18 @@ function seg(name, options, value) {
   </div>`;
 }
 
-async function openExport(doc) {
-  const pages = await db.pagesOf(doc);
+/** ส่งออกทั้งเอกสาร หรือเฉพาะหน้าที่เลือก (onlyIds) ตามลำดับในเอกสาร */
+async function openExport(doc, onlyIds) {
+  let pages = await db.pagesOf(doc);
+  const partial = Array.isArray(onlyIds) && onlyIds.length < pages.length;
+  if (onlyIds) pages = pages.filter((p) => onlyIds.includes(p.id));
   if (!pages.length) return toast('เอกสารนี้ยังไม่มีหน้า');
-  const opts = { format: settings.format, quality: settings.quality, pageSize: settings.pageSize, name: doc.name };
+  const name = partial ? `${doc.name} (${pages.length} หน้า)` : doc.name;
+  const opts = { format: settings.format, quality: settings.quality, pageSize: settings.pageSize, name };
   let files = null;
 
   const html = `
-    <h2>ส่งออก “${esc(doc.name)}”</h2>
+    <h2>ส่งออก “${esc(doc.name)}”${partial ? ` · ${pages.length} หน้าที่เลือก` : ''}</h2>
     <div class="field"><span class="label">รูปแบบ</span>${seg('format', [['pdf', 'PDF'], ['jpg', 'JPG']], opts.format)}</div>
     <label class="field"><span class="label">ชื่อไฟล์</span><input class="input" name="name" value="${esc(opts.name)}" autocomplete="off"></label>
     <div class="field"><span class="label">ขนาดไฟล์</span>${seg('quality', Object.entries(QUALITIES).map(([k, q]) => [k, q.label]), opts.quality)}</div>
@@ -711,6 +839,7 @@ async function openSettings() {
 
   const html = `
     <h2>ตั้งค่า</h2>
+    <div class="field"><span class="label">กล้อง</span>${seg('camera', [['app', 'กล้องในแอป (มีไฟฉาย)'], ['system', 'กล้องของระบบ']], settings.camera)}</div>
     <div class="field"><span class="label">ฟิลเตอร์เริ่มต้น</span>${seg('filter', FILTERS.map((f) => [f.id, f.label]), settings.filter)}</div>
     <div class="field"><span class="label">ขนาดหน้า PDF</span>${seg('pageSize', [['a4', 'A4'], ['fit', 'ตามภาพ']], settings.pageSize)}</div>
     <div class="field"><span class="label">ขนาดไฟล์ส่งออก</span>${seg('quality', Object.entries(QUALITIES).map(([k, q]) => [k, q.label]), settings.quality)}</div>

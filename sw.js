@@ -1,6 +1,6 @@
 // Service worker: เก็บไฟล์แอปทั้งหมดไว้ในเครื่อง เพื่อให้เปิดใช้ได้แม้ไม่มีอินเทอร์เน็ต
 // เปลี่ยน VERSION ให้ตรงกับ js/config.js ทุกครั้งที่ปล่อยเวอร์ชันใหม่
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const CACHE = `docscan-${VERSION}`;
 const ASSETS = [
   './',
@@ -14,6 +14,7 @@ const ASSETS = [
   'js/icons.js',
   'js/imaging.js',
   'js/editor.js',
+  'js/camera.js',
   'js/exporter.js',
   'js/cv-worker.js',
   'vendor/opencv.js',

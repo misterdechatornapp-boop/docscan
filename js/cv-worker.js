@@ -109,7 +109,7 @@ function orderCorners(pts) {
 
 /* ---------- ดัดภาพ + ฟิลเตอร์ ---------- */
 
-function process({ image, corners, filter, rotation }) {
+function process({ image, corners, filter, rotation, contrast = 0.5 }) {
   let mat = toMat(image);
   if (corners) {
     const p = corners.map(([x, y]) => [x * image.w, y * image.h]);
@@ -125,7 +125,7 @@ function process({ image, corners, filter, rotation }) {
     mat = warped;
   }
 
-  mat = applyFilter(mat, filter);
+  mat = applyFilter(mat, filter, contrast);
 
   if (rotation) {
     const code = { 90: cv.ROTATE_90_CLOCKWISE, 180: cv.ROTATE_180, 270: cv.ROTATE_90_COUNTERCLOCKWISE }[rotation];
@@ -146,7 +146,7 @@ function process({ image, corners, filter, rotation }) {
   return out;
 }
 
-function applyFilter(rgba, filter) {
+function applyFilter(rgba, filter, contrast) {
   if (!filter || filter === 'original') return rgba;
   const rgb = new cv.Mat();
   cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
@@ -154,34 +154,48 @@ function applyFilter(rgba, filter) {
   const flat = flattenLight(rgb);
   rgb.delete();
   if (filter === 'color') {
-    flat.convertTo(flat, -1, 1.12, -14);
+    levels(flat, contrast);
     return flat;
   }
   const gray = new cv.Mat();
   cv.cvtColor(flat, gray, cv.COLOR_RGB2GRAY);
   flat.delete();
-  if (filter === 'gray') {
-    gray.convertTo(gray, -1, 1.15, -18);
-    return gray;
-  }
+  levels(gray, contrast);
+  if (filter === 'gray') return gray;
   // ขาวดำคมชัด
   let block = Math.round(Math.min(gray.cols, gray.rows) / 40);
   block = Math.max(15, block % 2 ? block : block + 1);
   const bw = new cv.Mat();
-  cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 12);
+  cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 10);
   gray.delete();
   return bw;
 }
 
+/**
+ * ปรับระดับแสง: ค่าที่สว่างกว่าจุดขาวกลายเป็นขาวล้วน (เงาจาง ๆ ที่เหลือหายไป)
+ * และค่าที่มืดกว่าจุดดำกลายเป็นดำ (ตัวหนังสือเข้มขึ้น) · contrast 0..1 (0.5 = ค่าเริ่มต้น)
+ */
+function levels(mat, contrast) {
+  const s = Math.min(1, Math.max(0, contrast));
+  const lo = 15 + 70 * s;
+  const hi = 250 - 75 * s;
+  const lut = new Uint8Array(256);
+  for (let v = 0; v < 256; v++) lut[v] = Math.round(255 * Math.min(1, Math.max(0, (v - lo) / (hi - lo))));
+  const d = mat.data;
+  for (let i = 0; i < d.length; i++) d[i] = lut[d[i]];
+}
+
 /** ลบเงา/แสงไม่สม่ำเสมอ: ประมาณสีพื้นกระดาษจากภาพย่อ แล้วหารออก ให้พื้นขาวทั้งแผ่น */
 function flattenLight(rgb) {
-  const f = 8;
+  // ย่อน้อยลง (เดิม 1/8) ให้ตามขอบเงาที่คมได้ใกล้ขึ้น
+  // close (dilate แล้ว erode) ลบตัวหนังสือออกจากภาพพื้น แต่คงตำแหน่งขอบเงาไว้ ไม่เกิดเส้นเทาตามขอบ
+  const f = 5;
   const small = new cv.Mat();
   cv.resize(rgb, small, new cv.Size(Math.max(1, Math.round(rgb.cols / f)), Math.max(1, Math.round(rgb.rows / f))), 0, 0, cv.INTER_AREA);
   const k = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
-  cv.dilate(small, small, k);
+  cv.morphologyEx(small, small, cv.MORPH_CLOSE, k);
   k.delete();
-  cv.medianBlur(small, small, 5);
+  cv.medianBlur(small, small, 7);
   const bg = new cv.Mat();
   cv.resize(small, bg, rgb.size(), 0, 0, cv.INTER_LINEAR);
   small.delete();

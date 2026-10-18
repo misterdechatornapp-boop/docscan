@@ -498,3 +498,154 @@ dialog.editor::backdrop { background: #000; }
   font-size: 15px;
 }
 .chip.active { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+/* ---------- โหมดเลือกหน้า ---------- */
+.select-mode .page-card { transition: transform .12s; }
+.page-card.selected { outline: 3px solid var(--accent); outline-offset: 2px; transform: scale(.96); }
+.page-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 2px solid #fff;
+  background: rgb(15 17 21 / .45);
+  color: transparent;
+}
+.page-check .ic { width: 18px; height: 18px; }
+.page-card.selected .page-check { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.sel-bar .bar-btn { min-width: 110px; }
+.bar-btn.danger { color: var(--danger); }
+
+/* ---------- แถบคอนทราสต์ ---------- */
+.ed-contrast {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 16px 10px;
+  background: var(--surface);
+  font-size: 14px;
+}
+.ed-contrast input { flex: 1; accent-color: var(--accent); min-height: 32px; }
+.ed-contrast-val { width: 2.5em; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+
+/* ---------- กล้องในแอป ---------- */
+dialog.camera {
+  width: 100vw;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border: 0;
+  background: #000;
+  overflow: hidden;
+}
+dialog.camera::backdrop { background: #000; }
+.cam-video, .cam-overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+.cam-video { object-fit: contain; } /* เห็นเต็มภาพเท่าที่จะถ่ายได้จริง */
+.cam-overlay { pointer-events: none; }
+.cam-flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+.cam-top, .cam-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  background: linear-gradient(rgb(0 0 0 / .55), rgb(0 0 0 / 0));
+  color: #fff;
+}
+.cam-top { top: 0; padding-top: calc(var(--top) + 10px); padding-bottom: 24px; }
+.cam-bottom {
+  bottom: 0;
+  padding-top: 28px;
+  padding-bottom: calc(var(--bottom) + 18px);
+  background: linear-gradient(rgb(0 0 0 / 0), rgb(0 0 0 / .6));
+}
+.cam-hint { font-size: 14px; text-align: center; text-shadow: 0 1px 3px #000; }
+.cam-btn {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / .45);
+}
+.cam-btn[aria-pressed="true"] { background: #facc15; color: #1a1400; }
+.cam-side {
+  width: 84px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+}
+.cam-count {
+  min-width: 34px;
+  height: 34px;
+  padding: 0 8px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgb(255 255 255 / .18);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.cam-shutter {
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 4px rgb(0 0 0 / .4), 0 0 0 7px #fff;
+}
+.cam-shutter:active { transform: scale(.93); }
+.cam-shutter:disabled { opacity: .5; }
+
+/* ---------- แนวนอน (มือถือเอียง) ---------- */
+@media (orientation: landscape) and (max-height: 540px) {
+  .topbar { padding-top: calc(var(--top) + 2px); padding-bottom: 2px; }
+  .topbar h1 { font-size: 17px; }
+  .bottombar { padding-top: 4px; padding-bottom: calc(var(--bottom) + 4px); }
+  .shutter { width: 52px; height: 52px; }
+  .ed-top { padding-top: calc(var(--top) + 4px); padding-bottom: 4px; }
+  .ed-top .btn { min-height: 36px; }
+  .ed-tools, .toolbar { padding-top: 2px; padding-bottom: calc(var(--bottom) + 2px); }
+  .tool { flex-direction: row; gap: 6px; padding: 6px 10px; }
+  .ed-filters { padding: 4px 12px; }
+  .chip { min-height: 32px; }
+  .ed-contrast { padding-bottom: 4px; }
+  .ed-stage .ed-status { bottom: 4px; }
+  /* หน้าฟิลเตอร์: ภาพอยู่ซ้าย แผงควบคุมอยู่ขวา */
+  .ed-step[data-step="2"]:not([hidden]) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) min(300px, 42vw);
+    grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 1fr);
+  }
+  .ed-step[data-step="2"] .ed-top { grid-column: 1 / -1; }
+  .ed-step[data-step="2"] .ed-preview { grid-column: 1; grid-row: 2 / -1; padding: 8px; }
+  .ed-step[data-step="2"] .ed-filters,
+  .ed-step[data-step="2"] .ed-contrast,
+  .ed-step[data-step="2"] .ed-tools { grid-column: 2; border-top: 0; }
+  .ed-step[data-step="2"] .ed-filters { grid-row: 3; }
+  .ed-step[data-step="2"] .ed-contrast { grid-row: 4; }
+  .ed-step[data-step="2"] .ed-tools { grid-row: 5; flex-wrap: wrap; }
+  .ed-step[data-step="2"]::after { content: ""; grid-column: 2; grid-row: 2; background: var(--surface); }
+  .ed-step[data-step="2"]::before { content: ""; grid-column: 2; grid-row: 6; background: var(--surface); }
+  /* กล้อง: ปุ่มย้ายไปขอบขวาเป็นแนวตั้ง */
+  .cam-bottom {
+    left: auto;
+    top: 0;
+    width: 120px;
+    flex-direction: column;
+    justify-content: center;
+    padding: 16px max(16px, env(safe-area-inset-right, 0px)) 16px 16px;
+    background: linear-gradient(90deg, rgb(0 0 0 / 0), rgb(0 0 0 / .6));
+  }
+  .cam-top { right: 120px; }
+}
