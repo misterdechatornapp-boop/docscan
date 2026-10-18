@@ -83,18 +83,22 @@ function imagePayload(canvas) {
 /** โหลด OpenCV ล่วงหน้า (ไฟล์ใหญ่ ~10 MB) */
 export const warmup = () => call('init');
 
-/** หาขอบกระดาษ คืนมุม 4 จุดแบบสัดส่วน 0..1 หรือ null ถ้าหาไม่เจอ */
-export async function detectCorners(canvas) {
+/** หาขอบกระดาษ คืน { corners, mids } แบบสัดส่วน 0..1 หรือ null · mids = จุดกลางขอบที่โค้ง (null = ขอบตรง) */
+export async function detectPage(canvas) {
   const small = scaleCanvas(canvas, 640);
   const image = imagePayload(small);
   freeCanvas(small);
   return call('detect', { image }, [image.data]);
 }
 
+/** หาเฉพาะมุม 4 จุด (ใช้กับกรอบสดในกล้อง) */
+export const detectCorners = async (canvas) => (await detectPage(canvas))?.corners ?? null;
+
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, filter, rotation, contrast = 0.5 }) {
+export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5 }) {
   const image = imagePayload(canvas);
-  const r = await call('process', { image, corners: isFullFrame(corners) ? null : corners, filter, rotation, contrast }, [image.data]);
+  const plain = isFullFrame(corners) && !mids;
+  const r = await call('process', { image, corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast }, [image.data]);
   const out = document.createElement('canvas');
   out.width = r.w;
   out.height = r.h;

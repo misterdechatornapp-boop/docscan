@@ -1,18 +1,21 @@
 // กล้องในแอป: เปิดไฟฉายได้ และเห็นกรอบเอกสารสดขณะเล็ง
 import { icon } from './icons.js';
 import { toast } from './ui.js';
-import { detectCorners, scaleCanvas, freeCanvas } from './imaging.js';
+import { detectCorners, scaleCanvas, freeCanvas, toBlob } from './imaging.js';
 
 export const cameraSupported = () => !!navigator.mediaDevices?.getUserMedia;
 
 /**
  * เปิดกล้องเต็มจอ
  * @param {object} o
- * @param {(canvas: HTMLCanvasElement) => Promise<'continue'|'done'>} o.onShot เรียกหลังกดชัตเตอร์ (เปิดหน้าปรับภาพ/บันทึก)
+ * @param {'batch'|'single'} o.mode ต่อเนื่อง = ถ่ายแล้วเก็บทันที จัดขอบอัตโนมัติ · ทีละหน้า = เปิดหน้าปรับภาพทุกครั้ง
+ * @param {(mode: string) => void} o.onModeChange
+ * @param {(canvas: HTMLCanvasElement) => Promise<'saved'|'done'|'cancel'>} o.onShot โหมดทีละหน้า: เปิดหน้าปรับภาพ/บันทึก
+ * @param {(blob: Blob) => void} o.onBatchShot โหมดต่อเนื่อง: ส่งภาพไปจัดขอบ/บันทึกเบื้องหลัง
  * @param {Function} o.onSystemCamera เรียกทันทีในจังหวะแตะ เมื่อผู้ใช้เลือกกล้องของระบบ
  * @returns {Promise<{error?: Error}>} เสร็จเมื่อปิดกล้อง
  */
-export async function openCameraView({ onShot, onSystemCamera }) {
+export async function openCameraView({ mode = 'batch', onModeChange, onShot, onBatchShot, onSystemCamera }) {
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -33,13 +36,19 @@ export async function openCameraView({ onShot, onSystemCamera }) {
     <div class="cam-flash"></div>
     <header class="cam-top">
       <button type="button" class="cam-btn" data-act="close" aria-label="ปิดกล้อง">${icon('close')}</button>
-      <span class="cam-hint">เล็งให้เห็นกระดาษทั้งแผ่น</span>
+      <div class="cam-center">
+        <div class="cam-mode" role="radiogroup" aria-label="โหมดถ่าย">
+          <button type="button" role="radio" data-mode="batch">ต่อเนื่อง</button>
+          <button type="button" role="radio" data-mode="single">ทีละหน้า</button>
+        </div>
+        <span class="cam-hint">เล็งให้เห็นกระดาษทั้งแผ่น</span>
+      </div>
       <button type="button" class="cam-btn" data-act="torch" aria-label="ไฟฉาย" aria-pressed="false">${icon('flash')}</button>
     </header>
     <footer class="cam-bottom">
       <button type="button" class="cam-side" data-act="system">${icon('camera')}<span>กล้องระบบ</span></button>
       <button type="button" class="cam-shutter" data-act="shoot" aria-label="ถ่าย"></button>
-      <button type="button" class="cam-side" data-act="done"><span class="cam-count">0</span><span>เสร็จ</span></button>
+      <button type="button" class="cam-side" data-act="done"><span class="cam-count"><img alt="" hidden><b>0</b></span><span>เสร็จ</span></button>
     </footer>`;
   document.body.appendChild(dlg);
 
@@ -56,6 +65,20 @@ export async function openCameraView({ onShot, onSystemCamera }) {
   let detecting = false;
   let shots = 0;
   let closed = false;
+  const encoding = new Set(); // ภาพที่กำลังแปลงเป็นไฟล์ (รอให้ครบก่อนปิดกล้อง)
+  const setMode = (m) => {
+    mode = m;
+    dlg.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === m)));
+  };
+  const bumpCount = (thumbUrl) => {
+    shots++;
+    dlg.querySelector('.cam-count b').textContent = shots;
+    if (thumbUrl) {
+      const img = dlg.querySelector('.cam-count img');
+      img.src = thumbUrl;
+      img.hidden = false;
+    }
+  };
 
   /* ----- กรอบเอกสารสด ----- */
   function videoRect() {
@@ -135,16 +158,36 @@ export async function openCameraView({ onShot, onSystemCamera }) {
       stream.getTracks().forEach((t) => t.stop());
       if (dlg.open) dlg.close();
       dlg.remove();
-      resolve({});
+      Promise.allSettled([...encoding]).then(() => resolve({}));
     };
 
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); if (!busy) close(); });
     dlg.addEventListener('click', async (e) => {
+      const modeBtn = e.target.closest('[data-mode]');
+      if (modeBtn && !busy) { setMode(modeBtn.dataset.mode); onModeChange?.(mode); return; }
       const act = e.target.closest('[data-act]')?.dataset.act;
       if (!act || busy) return;
       if (act === 'close' || act === 'done') close();
       else if (act === 'torch') setTorch(!torchOn);
       else if (act === 'system') { onSystemCamera(); close(); }
+      else if (act === 'shoot' && mode === 'batch') {
+        if (!video.videoWidth || shutter.disabled) return;
+        shutter.disabled = true;
+        const canvas = grabFrame();
+        dlg.querySelector('.cam-flash').animate([{ opacity: 0.85 }, { opacity: 0 }], { duration: 200 });
+        const thumb = scaleCanvas(canvas, 120);
+        const thumbUrl = thumb.toDataURL('image/jpeg', 0.6);
+        freeCanvas(thumb);
+        // เก็บเป็นไฟล์ JPEG ทันทีแล้วคืนหน่วยความจำ (ถ่ายรัว ๆ หลายสิบหน้าก็ไม่ค้าง)
+        const job = toBlob(canvas, 0.92).then((blob) => {
+          freeCanvas(canvas);
+          onBatchShot(blob);
+        });
+        encoding.add(job);
+        job.finally(() => encoding.delete(job));
+        bumpCount(thumbUrl);
+        setTimeout(() => { shutter.disabled = false; }, 250);
+      }
       else if (act === 'shoot') {
         if (!video.videoWidth) return;
         busy = true;
@@ -154,10 +197,7 @@ export async function openCameraView({ onShot, onSystemCamera }) {
         drawQuad(null);
         try {
           const next = await onShot(canvas);
-          if (next === 'saved' || next === 'done') {
-            shots++;
-            dlg.querySelector('.cam-count').textContent = shots;
-          }
+          if (next === 'saved' || next === 'done') bumpCount();
           if (next === 'done') return close();
         } finally {
           busy = false;
@@ -166,6 +206,7 @@ export async function openCameraView({ onShot, onSystemCamera }) {
       }
     });
 
+    setMode(mode);
     dlg.showModal();
     detectLoop();
   });

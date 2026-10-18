@@ -2,14 +2,14 @@
 import * as db from './db.js';
 import { icon } from './icons.js';
 import { $, esc, modal, sheet, confirmBox, promptBox, toast, withBusy, progress, fmtDate, fmtSize } from './ui.js';
-import { loadCanvas, toBlob, freeCanvas, scaleCanvas, detectCorners, processCanvas, warmup, FULL_FRAME, THUMB_SIDE } from './imaging.js';
+import { loadCanvas, toBlob, freeCanvas, scaleCanvas, detectPage, processCanvas, warmup, FULL_FRAME, THUMB_SIDE } from './imaging.js';
 import { openEditor, FILTERS } from './editor.js';
 import { buildPdf, buildJpgs, canShareFiles, shareFiles, downloadFiles, QUALITIES } from './exporter.js';
 import { openCameraView, cameraSupported } from './camera.js';
 import Sortable from '../vendor/sortable.esm.js';
 import { VERSION, APP_NAME, TRASH_DAYS } from './config.js';
 
-const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, camera: 'app', pageSize: 'a4', quality: 'medium', format: 'pdf' };
+const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
 let settings = { ...DEFAULT_SETTINGS };
 
 const app = $('#app');
@@ -25,8 +25,10 @@ function blobUrl(blob) {
   return u;
 }
 function releaseUrls() {
-  urls.forEach((u) => URL.revokeObjectURL(u));
+  // คืนแบบหน่วงเวลา: ภาพของหน้าเดิมที่ยังโหลดค้างอยู่จะไม่ขึ้น error
+  const old = urls;
   urls = [];
+  setTimeout(() => old.forEach((u) => URL.revokeObjectURL(u)), 2000);
 }
 
 /* ---------- เส้นทางในแอป (#/...) ---------- */
@@ -101,7 +103,12 @@ async function buildPage(docId, srcCanvas, opts, existing) {
   freeCanvas(out);
   freeCanvas(thumbCanvas);
   const page = existing || { id: db.uid(), docId, createdAt: Date.now(), original: await toBlob(srcCanvas, 0.9) };
-  Object.assign(page, { processed, thumb, corners: opts.corners, filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5 });
+  Object.assign(page, {
+    processed, thumb,
+    corners: opts.corners, mids: opts.mids || null,
+    filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5,
+    needsReview: !!opts.needsReview,
+  });
   await db.put('pages', page);
   return page;
 }
@@ -139,7 +146,14 @@ async function openCamera(docId) {
   if (settings.camera === 'system' || !cameraSupported()) return openSystemCamera(target);
   let saved = 0;
   const res = await openCameraView({
+    mode: settings.camMode,
+    onModeChange: (m) => { settings.camMode = m; db.setMeta('settings', settings); },
     onSystemCamera: () => openSystemCamera(target),
+    onBatchShot: (blob) => {
+      saved++;
+      enqueue(() => autoPage(target.docId, blob, target.folderId))
+        .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
+    },
     onShot: async (canvas) => {
       const r = await openEditor({ canvas, filter: settings.filter, contrast: settings.contrast, onContinue: () => {} });
       if (!r) { freeCanvas(canvas); return 'cancel'; }
@@ -158,11 +172,34 @@ async function openCamera(docId) {
     return;
   }
   if (!saved) return;
-  const prog = progress('กำลังบันทึก…');
+  const prog = progress('กำลังจัดขอบและบันทึก…');
   await queue;
   prog.close();
   if (parseRoute().view === 'doc' && parseRoute().docId === target.docId) route();
   else go(`#/doc/${target.docId}`);
+}
+
+/**
+ * บันทึกภาพเป็นหน้าใหม่โดยไม่ต้องเปิดหน้าปรับภาพ: หาขอบ (รวมขอบโค้ง) + ฟิลเตอร์ล่าสุดอัตโนมัติ
+ * หาขอบไม่เจอ = ใช้ทั้งภาพ แล้วติดป้าย "ตรวจขอบ" ไว้ให้มาแก้ทีหลัง
+ */
+async function autoPage(docId, blob, folderId) {
+  const c = await loadCanvas(blob);
+  try {
+    const found = await detectPage(c);
+    const page = await buildPage(docId, c, {
+      corners: found?.corners || FULL_FRAME,
+      mids: found?.mids || null,
+      filter: settings.filter,
+      contrast: settings.contrast,
+      rotation: 0,
+      needsReview: !found,
+    });
+    await appendPages(docId, [page], folderId);
+    return page;
+  } finally {
+    freeCanvas(c);
+  }
 }
 
 /** จำฟิลเตอร์/คอนทราสต์ล่าสุดไว้ใช้กับภาพถัดไป */
@@ -235,11 +272,7 @@ async function importMany(files, target) {
     for (let i = 0; i < files.length; i++) {
       prog.update(`กำลังประมวลผลภาพ ${i + 1}/${files.length}`);
       try {
-        const c = await loadCanvas(files[i]);
-        const corners = (await detectCorners(c)) || FULL_FRAME;
-        const page = await enqueue(() => buildPage(docId, c, { corners, filter: settings.filter, contrast: settings.contrast, rotation: 0 }));
-        freeCanvas(c);
-        await enqueue(() => appendPages(docId, [page], target?.folderId));
+        await enqueue(() => autoPage(docId, files[i], target?.folderId));
       } catch (err) {
         console.error(err);
         failed++;
@@ -476,10 +509,12 @@ async function renderDoc(docId) {
   const hint = sel
     ? '<p class="hint">แตะหน้าเพื่อเลือกหรือเลิกเลือก</p>'
     : pages.length > 1 ? '<p class="hint">แตะค้างเพื่อเลือกหน้า · แตะค้างแล้วลากเพื่อเรียงลำดับ</p>' : '';
+  const review = !sel && pages.some((p) => p.needsReview)
+    ? `<p class="hint warn">${pages.filter((p) => p.needsReview).length} หน้าหาขอบกระดาษไม่เจอ · แตะหน้าที่มีป้าย “ตรวจขอบ” แล้วกด ขอบ/ฟิลเตอร์</p>` : '';
   const footer = sel
     ? `<footer class="bottombar sel-bar">
         <button class="bar-btn" data-act="sel-export" ${n ? '' : 'disabled'}>${icon('share')}<span>ส่งออก ${n} หน้า</span></button>
-        <span class="bar-spacer"></span>
+        <button class="bar-btn" data-act="sel-filter" ${n ? '' : 'disabled'}>${icon('sliders')}<span>ฟิลเตอร์</span></button>
         <button class="bar-btn danger" data-act="sel-delete" ${n ? '' : 'disabled'}>${icon('trash')}<span>ลบ ${n} หน้า</span></button>
       </footer>`
     : `<footer class="bottombar">
@@ -491,6 +526,7 @@ async function renderDoc(docId) {
   app.innerHTML = `
     <header class="topbar">${header}</header>
     <main class="scroll">
+      ${review}
       ${hint}
       <div class="grid ${sel ? 'select-mode' : ''}" id="grid">
         ${pages.map((p, i) => {
@@ -499,6 +535,7 @@ async function renderDoc(docId) {
           <button class="page-card ${on ? 'selected' : ''}" data-id="${p.id}" data-act="open-page" aria-label="หน้า ${i + 1}" ${sel ? `aria-pressed="${!!on}"` : ''}>
             <img src="${blobUrl(p.thumb)}" alt="" draggable="false">
             <span class="page-no">${i + 1}</span>
+            ${p.needsReview ? '<span class="page-flag">ตรวจขอบ</span>' : ''}
             ${sel ? `<span class="page-check">${icon('check')}</span>` : ''}
           </button>`;
         }).join('')}
@@ -582,6 +619,12 @@ async function renderDoc(docId) {
     } else if (act === 'sel-all') {
       selection.ids = n === pages.length ? new Set() : new Set(doc.pageIds);
       route();
+    } else if (act === 'sel-filter') {
+      const filter = await sheet(`ฟิลเตอร์สำหรับ ${n} หน้าที่เลือก`, FILTERS.map((x) => ({ id: x.id, label: x.label, icon: 'sliders' })));
+      if (!filter) return;
+      await refilterPages(doc, [...sel.ids], filter);
+      selection = null;
+      route();
     } else if (act === 'sel-export') {
       openExport(doc, [...sel.ids]);
     } else if (act === 'sel-delete') {
@@ -647,7 +690,7 @@ async function renderPage(docId, index) {
     else if (act === 'rotate') {
       await withBusy(t, async () => {
         const c = await loadCanvas(page.original);
-        await buildPage(docId, c, { corners: page.corners, filter: page.filter, contrast: page.contrast ?? 0.5, rotation: ((page.rotation || 0) + 90) % 360 }, page);
+        await buildPage(docId, c, { corners: page.corners, mids: page.mids, filter: page.filter, contrast: page.contrast ?? 0.5, rotation: ((page.rotation || 0) + 90) % 360, needsReview: page.needsReview }, page);
         freeCanvas(c);
         await refreshDoc(doc);
       });
@@ -669,9 +712,28 @@ async function renderPage(docId, index) {
   };
 }
 
+/** เปลี่ยนฟิลเตอร์หลายหน้าพร้อมกัน (คำนวณใหม่จากภาพต้นฉบับ ขอบ/การหมุนเดิม) */
+async function refilterPages(doc, ids, filter) {
+  const prog = progress('กำลังปรับฟิลเตอร์…');
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      prog.update(`กำลังปรับฟิลเตอร์ ${i + 1}/${ids.length}`);
+      const page = await db.get('pages', ids[i]);
+      if (!page) continue;
+      const c = await loadCanvas(page.original);
+      await buildPage(doc.id, c, { corners: page.corners, mids: page.mids, filter, contrast: page.contrast ?? settings.contrast, rotation: page.rotation, needsReview: page.needsReview }, page);
+      freeCanvas(c);
+    }
+    await refreshDoc(await db.get('docs', doc.id));
+    toast(`ปรับฟิลเตอร์ ${ids.length} หน้าแล้ว`);
+  } finally {
+    prog.close();
+  }
+}
+
 async function reEditPage(doc, page) {
   const canvas = await loadCanvas(page.original);
-  const res = await openEditor({ canvas, corners: page.corners, filter: page.filter, rotation: page.rotation, contrast: page.contrast ?? 0.5 });
+  const res = await openEditor({ canvas, corners: page.corners, mids: page.mids, filter: page.filter, rotation: page.rotation, contrast: page.contrast ?? 0.5 });
   if (res) {
     const prog = progress('กำลังบันทึก…');
     try {
