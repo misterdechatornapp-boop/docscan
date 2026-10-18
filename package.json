@@ -1,0 +1,16 @@
+{
+  "name": "docscan",
+  "version": "1.0.0",
+  "description": "สแกนง่าย — ถ่ายรูปเอกสาร ตัดขอบ เรียงหน้า ส่งออก PDF (เว็บแอปใช้ออฟไลน์ได้)",
+  "private": true,
+  "scripts": {
+    "start": "node serve.js",
+    "vendor": "node tools/copy-vendor.js",
+    "icons": "node tools/make-icons.js"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "4.10.0-release.1",
+    "pdf-lib": "1.17.1",
+    "sortablejs": "1.15.6"
+  }
+}

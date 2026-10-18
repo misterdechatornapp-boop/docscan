@@ -1,0 +1,264 @@
+// หน้าปรับภาพ 2 ขั้น: (1) ลากมุมให้ตรงขอบกระดาษ (2) เลือกฟิลเตอร์ + หมุน
+import { icon } from './icons.js';
+import { esc } from './ui.js';
+import { detectCorners, processCanvas, scaleCanvas, freeCanvas, FULL_FRAME } from './imaging.js';
+
+export const FILTERS = [
+  { id: 'color', label: 'ปรับสี' },
+  { id: 'gray', label: 'สีเทา' },
+  { id: 'bw', label: 'ขาวดำ' },
+  { id: 'original', label: 'ต้นฉบับ' },
+];
+
+/**
+ * เปิดหน้าปรับภาพ
+ * @param {object} o
+ * @param {HTMLCanvasElement} o.canvas ภาพต้นฉบับ
+ * @param {number[][]} [o.corners] มุมเดิม (ถ้าไม่ส่ง จะหาขอบอัตโนมัติ)
+ * @param {string} o.filter
+ * @param {number} [o.rotation]
+ * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
+ * @returns {Promise<{corners, filter, rotation}|null>}
+ */
+export function openEditor({ canvas, corners, filter, rotation = 0, onContinue }) {
+  const dlg = document.createElement('dialog');
+  dlg.className = 'editor';
+  dlg.setAttribute('aria-label', 'ปรับภาพเอกสาร');
+  dlg.innerHTML = `
+    <section class="ed-step" data-step="1">
+      <header class="ed-top">
+        <button type="button" class="btn btn-ghost" data-act="cancel">ยกเลิก</button>
+        <div class="ed-title">ปรับขอบเอกสาร</div>
+        <button type="button" class="btn btn-primary" data-act="next">ถัดไป</button>
+      </header>
+      <div class="ed-stage">
+        <div class="ed-frame">
+          <svg class="ed-poly" viewBox="0 0 1 1" preserveAspectRatio="none"><polygon vector-effect="non-scaling-stroke"/></svg>
+          ${[0, 1, 2, 3].map((i) => `<div class="ed-h" data-i="${i}" role="slider" aria-label="มุมที่ ${i + 1}" tabindex="0"></div>`).join('')}
+        </div>
+        <canvas class="ed-loupe" width="240" height="240"></canvas>
+        <div class="ed-status"></div>
+      </div>
+      <footer class="ed-tools">
+        <button type="button" class="tool" data-act="auto">${icon('wand')}<span>หาขอบอัตโนมัติ</span></button>
+        <button type="button" class="tool" data-act="full">${icon('expand')}<span>ใช้ทั้งภาพ</span></button>
+      </footer>
+    </section>
+    <section class="ed-step" data-step="2" hidden>
+      <header class="ed-top">
+        <button type="button" class="btn btn-ghost" data-act="back">${icon('back')}ขอบ</button>
+        <div class="ed-title">ฟิลเตอร์</div>
+        <button type="button" class="btn btn-primary" data-act="save">บันทึก</button>
+      </header>
+      <div class="ed-stage ed-preview"><div class="spinner"></div></div>
+      <div class="ed-filters">
+        ${FILTERS.map((f) => `<button type="button" class="chip" data-filter="${f.id}">${esc(f.label)}</button>`).join('')}
+      </div>
+      <footer class="ed-tools">
+        <button type="button" class="tool" data-act="rotL">${icon('rotL')}<span>หมุนซ้าย</span></button>
+        <button type="button" class="tool" data-act="rotR">${icon('rotR')}<span>หมุนขวา</span></button>
+        ${onContinue ? `<button type="button" class="tool tool-accent" data-act="saveMore">${icon('camera')}<span>บันทึก + ถ่ายต่อ</span></button>` : ''}
+      </footer>
+    </section>`;
+  document.body.appendChild(dlg);
+
+  const frame = dlg.querySelector('.ed-frame');
+  const stage = dlg.querySelector('.ed-stage');
+  const poly = dlg.querySelector('polygon');
+  const handles = [...dlg.querySelectorAll('.ed-h')];
+  const loupe = dlg.querySelector('.ed-loupe');
+  const status = dlg.querySelector('.ed-status');
+  const nextBtn = dlg.querySelector('[data-act="next"]');
+  const previewBox = dlg.querySelector('.ed-preview');
+
+  const state = {
+    corners: corners ? corners.map((p) => [...p]) : FULL_FRAME.map((p) => [...p]),
+    filter,
+    rotation,
+  };
+
+  // ภาพสำหรับแสดงบนจอ (ย่อให้พอดีจอ เพื่อความลื่น)
+  const display = scaleCanvas(canvas, Math.max(window.innerWidth, window.innerHeight) * Math.min(2, devicePixelRatio || 1));
+  display.className = 'ed-img';
+  frame.prepend(display);
+  let previewSrc = null;
+
+  function layout() {
+    const r = stage.getBoundingClientRect();
+    const pad = 24;
+    const s = Math.min((r.width - pad * 2) / display.width, (r.height - pad * 2) / display.height);
+    frame.style.width = `${display.width * s}px`;
+    frame.style.height = `${display.height * s}px`;
+  }
+
+  function render() {
+    state.corners.forEach(([x, y], i) => {
+      handles[i].style.left = `${x * 100}%`;
+      handles[i].style.top = `${y * 100}%`;
+    });
+    poly.setAttribute('points', state.corners.map((p) => p.join(',')).join(' '));
+    const ok = isConvex(state.corners);
+    frame.classList.toggle('invalid', !ok);
+    nextBtn.disabled = !ok;
+    if (!ok) status.textContent = 'มุมไขว้กัน — ลากมุมให้เป็นสี่เหลี่ยม';
+    else if (status.dataset.msg) status.textContent = status.dataset.msg;
+    else status.textContent = '';
+  }
+
+  function setStatus(msg) {
+    status.dataset.msg = msg;
+    render();
+  }
+
+  async function autoDetect() {
+    setStatus('กำลังหาขอบกระดาษ…');
+    try {
+      const found = await detectCorners(canvas);
+      if (found) {
+        state.corners = found;
+        setStatus('');
+      } else {
+        state.corners = FULL_FRAME.map((p) => [...p]);
+        setStatus('ไม่พบขอบกระดาษ — ลากมุมทั้ง 4 เอง');
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus('หาขอบไม่สำเร็จ — ลากมุมเอง');
+    }
+  }
+
+  /* ----- ลากมุม ----- */
+  handles.forEach((h, i) => {
+    let off = [0, 0];
+    h.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const r = frame.getBoundingClientRect();
+      off = [e.clientX - (r.left + state.corners[i][0] * r.width), e.clientY - (r.top + state.corners[i][1] * r.height)];
+      h.setPointerCapture(e.pointerId);
+      h.classList.add('dragging');
+      status.dataset.msg = '';
+    });
+    h.addEventListener('pointermove', (e) => {
+      if (!h.hasPointerCapture(e.pointerId)) return;
+      const r = frame.getBoundingClientRect();
+      const x = clamp((e.clientX - off[0] - r.left) / r.width);
+      const y = clamp((e.clientY - off[1] - r.top) / r.height);
+      state.corners[i] = [x, y];
+      render();
+      drawLoupe(x, y, e.clientX < window.innerWidth / 2);
+    });
+    h.addEventListener('lostpointercapture', () => {
+      h.classList.remove('dragging');
+      loupe.classList.remove('show');
+    });
+    h.addEventListener('keydown', (e) => {
+      const step = 0.005;
+      const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+      if (!d) return;
+      e.preventDefault();
+      state.corners[i] = [clamp(state.corners[i][0] + d[0]), clamp(state.corners[i][1] + d[1])];
+      render();
+    });
+  });
+
+  function drawLoupe(x, y, fingerOnLeft) {
+    const ctx = loupe.getContext('2d');
+    const zoom = 2.5;
+    const r = frame.getBoundingClientRect();
+    const scale = display.width / r.width; // พิกเซลภาพต่อพิกเซลจอ
+    const srcSize = (loupe.width / 2 / zoom) * scale;
+    const sx = x * display.width - srcSize / 2;
+    const sy = y * display.height - srcSize / 2;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, loupe.width, loupe.height);
+    ctx.drawImage(display, sx, sy, srcSize, srcSize, 0, 0, loupe.width, loupe.height);
+    ctx.strokeStyle = '#2dd4bf';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(loupe.width / 2, loupe.height / 2 - 26); ctx.lineTo(loupe.width / 2, loupe.height / 2 + 26);
+    ctx.moveTo(loupe.width / 2 - 26, loupe.height / 2); ctx.lineTo(loupe.width / 2 + 26, loupe.height / 2);
+    ctx.stroke();
+    loupe.classList.toggle('right', fingerOnLeft);
+    loupe.classList.add('show');
+  }
+
+  /* ----- ขั้นที่ 2: พรีวิวฟิลเตอร์ ----- */
+  let previewToken = 0;
+  async function renderPreview() {
+    const token = ++previewToken;
+    previewBox.classList.add('loading');
+    dlg.querySelectorAll('[data-filter]').forEach((b) => b.classList.toggle('active', b.dataset.filter === state.filter));
+    try {
+      if (!previewSrc) previewSrc = scaleCanvas(canvas, 1400);
+      const out = await processCanvas(previewSrc, state);
+      if (token !== previewToken) { freeCanvas(out); return; }
+      out.className = 'ed-preview-img';
+      const old = previewBox.querySelector('canvas');
+      if (old) { old.replaceWith(out); freeCanvas(old); } else previewBox.appendChild(out);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      if (token === previewToken) previewBox.classList.remove('loading');
+    }
+  }
+
+  function showStep(n) {
+    dlg.querySelectorAll('.ed-step').forEach((s) => { s.hidden = s.dataset.step !== String(n); });
+    if (n === 1) requestAnimationFrame(layout);
+    else renderPreview();
+  }
+
+  return new Promise((resolve) => {
+    // ปิดและคืนค่าทันที ไม่รอเหตุการณ์ close (บางเบราว์เซอร์ส่งช้าเมื่อหน้าจอไม่ได้วาด)
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('resize', layout);
+      if (dlg.open) dlg.close();
+      freeCanvas(display);
+      freeCanvas(previewSrc);
+      dlg.remove();
+      resolve(value);
+    };
+
+    dlg.addEventListener('click', (e) => {
+      const fb = e.target.closest('[data-filter]');
+      if (fb) { state.filter = fb.dataset.filter; renderPreview(); return; }
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act === 'cancel') finish(null);
+      else if (act === 'next') showStep(2);
+      else if (act === 'back') showStep(1);
+      else if (act === 'auto') autoDetect();
+      else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); setStatus(''); }
+      else if (act === 'rotL') { state.rotation = (state.rotation + 270) % 360; renderPreview(); }
+      else if (act === 'rotR') { state.rotation = (state.rotation + 90) % 360; renderPreview(); }
+      else if (act === 'save') finish({ ...state });
+      else if (act === 'saveMore') { onContinue(); finish({ ...state }); }
+    });
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
+    dlg.addEventListener('close', () => finish(null));
+
+    window.addEventListener('resize', layout);
+    dlg.showModal();
+    layout();
+    render();
+    if (!corners) autoDetect();
+  });
+}
+
+const clamp = (v) => Math.min(1, Math.max(0, v));
+
+function isConvex(pts) {
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const [a, b, c] = [pts[i], pts[(i + 1) % 4], pts[(i + 2) % 4]];
+    const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    if (Math.abs(cross) < 1e-9) return false;
+    const s = Math.sign(cross);
+    if (sign && s !== sign) return false;
+    sign = s;
+  }
+  return true;
+}
