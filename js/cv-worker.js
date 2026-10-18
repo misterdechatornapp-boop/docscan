@@ -162,34 +162,50 @@ function edgeMids(corners, contour) {
 
 /* ---------- ดัดภาพ + ฟิลเตอร์ ---------- */
 
-function process({ image, corners, mids, filter, rotation, contrast = 0.5 }) {
+function process({ image, corners, mids, filter, rotation, contrast = 0.5, straighten = false }) {
   let mat = toMat(image);
   if (corners) {
     const p = corners.map(([x, y]) => [x * image.w, y * image.h]);
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     const w = Math.max(1, Math.round(Math.max(dist(p[0], p[1]), dist(p[3], p[2]))));
     const h = Math.max(1, Math.round(Math.max(dist(p[0], p[3]), dist(p[1], p[2]))));
-    // ขอบโค้งอาจป่องออกนอกกรอบมุม จึงเผื่อขอบรอบภาพไว้ให้เส้นโค้งดึงพิกเซลจริงได้
-    const pad = mids ? Math.round(0.2 * Math.max(w, h)) : 0;
     const from = cv.matFromArray(4, 1, cv.CV_32FC2, p.flat());
-    const to = cv.matFromArray(4, 1, cv.CV_32FC2, [pad, pad, pad + w, pad, pad + w, pad + h, pad, pad + h]);
-    const M = cv.getPerspectiveTransform(from, to);
+    const transform = (pad) => {
+      const to = cv.matFromArray(4, 1, cv.CV_32FC2, [pad, pad, pad + w, pad, pad + w, pad + h, pad, pad + h]);
+      const M = cv.getPerspectiveTransform(from, to);
+      to.delete();
+      return M;
+    };
+    const project = (M) => ([x, y]) => {
+      const m = M.data64F, X = x * image.w, Y = y * image.h;
+      const z = m[6] * X + m[7] * Y + m[8];
+      return [(m[0] * X + m[1] * Y + m[2]) / z, (m[3] * X + m[4] * Y + m[5]) / z];
+    };
+    // ขอบโค้งอาจป่องออกนอกกรอบมุม: เผื่อขอบรอบภาพเท่าที่จำเป็น (ประหยัดหน่วยความจำบนมือถือ)
+    let pad = 0;
+    if (mids) {
+      const M0 = transform(0);
+      const out = Math.max(0, ...mids.map(project(M0)).map(([x, y]) => Math.max(-x, -y, x - w, y - h)));
+      M0.delete();
+      pad = Math.ceil(out * 1.3 + 8);
+    }
+    const M = transform(pad);
     const warped = new cv.Mat();
     cv.warpPerspective(mat, warped, M, new cv.Size(w + 2 * pad, h + 2 * pad), cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
     mat.delete();
     mat = warped;
     if (mids) {
-      const m = M.data64F;
-      const project = ([x, y]) => {
-        const X = x * image.w, Y = y * image.h;
-        const z = m[6] * X + m[7] * Y + m[8];
-        return [(m[0] * X + m[1] * Y + m[2]) / z, (m[3] * X + m[4] * Y + m[5]) / z];
-      };
-      const bent = straightenCurves(mat, w, h, pad, mids.map(project));
+      const bent = straightenCurves(mat, w, h, pad, mids.map(project(M)));
       mat.delete();
       mat = bent;
     }
-    from.delete(); to.delete(); M.delete();
+    from.delete();
+    M.delete();
+  }
+
+  if (straighten) {
+    const flat = straightenLines(mat);
+    if (flat) { mat.delete(); mat = flat; }
   }
 
   mat = applyFilter(mat, filter, contrast);
@@ -224,7 +240,12 @@ function straightenCurves(src, w, h, pad, midsR) {
   const P00 = [o, o], P10 = [o + w, o], P11 = [o + w, o + h], P01 = [o, o + h];
   const chordMid = [[o + w / 2, o], [o + w, o + h / 2], [o + w / 2, o + h], [o, o + h / 2]];
   const dev = Math.max(...midsR.map((m, i) => Math.hypot(m[0] - chordMid[i][0], m[1] - chordMid[i][1])));
-  if (dev < 0.004 * Math.max(w, h)) return src.roi(new cv.Rect(o, o, w, h)).clone();
+  if (dev < 0.004 * Math.max(w, h)) {
+    const view = src.roi(new cv.Rect(o, o, w, h));
+    const copy = view.clone();
+    view.delete();
+    return copy;
+  }
 
   // จุดควบคุมของเส้นโค้ง Bezier กำลังสองที่ผ่านจุดกลางขอบ: C = 2M − (A + B) / 2
   const ctrl = (M, A, B) => [2 * M[0] - (A[0] + B[0]) / 2, 2 * M[1] - (A[1] + B[1]) / 2];
@@ -281,6 +302,218 @@ function straightenCurves(src, w, h, pad, midsR) {
   mapX.delete();
   mapY.delete();
   return out;
+}
+
+/* ---------- ดัดเส้นให้ตรง (กระดาษป่อง/โค้งกลางแผ่น) ---------- */
+
+/**
+ * ใช้ "เส้นที่ควรตรง" ในเอกสารเป็นตัวอ้างอิง: เส้นตารางแนวนอน + แนวบรรทัดตัวหนังสือ (ควรเป็นแนวนอน)
+ * และเส้นตารางแนวตั้ง (ควรเป็นแนวตั้ง) → หาว่าแต่ละจุดเลื่อนไปเท่าไร แล้วดึงภาพกลับให้เส้นตรง
+ * คืน Mat ใหม่ หรือ null ถ้าหาเส้นไม่พอ / เส้นตรงอยู่แล้ว / ผลไม่น่าเชื่อถือ
+ */
+function straightenLines(src) {
+  const W = src.cols, H = src.rows;
+  const s = Math.min(1, 1000 / W); // วิเคราะห์ที่ภาพย่อ กว้างไม่เกิน 1000 px
+  const aw = Math.max(1, Math.round(W * s)), ah = Math.max(1, Math.round(H * s));
+  const small = new cv.Mat();
+  cv.resize(src, small, new cv.Size(aw, ah), 0, 0, cv.INTER_AREA);
+  const gray = new cv.Mat();
+  cv.cvtColor(small, gray, small.channels() === 4 ? cv.COLOR_RGBA2GRAY : cv.COLOR_RGB2GRAY);
+  small.delete();
+  const ink = new cv.Mat();
+  cv.adaptiveThreshold(gray, ink, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
+  gray.delete();
+
+  // เส้นแนวนอน: เส้นตาราง + บรรทัดตัวหนังสือ (เชื่อมตัวอักษรเป็นแถบยาวก่อน)
+  const rows = lineCurves(ink, aw, ah, true);
+  // เส้นแนวตั้ง: เฉพาะเส้นตาราง (หมุนภาพ 90° แล้วใช้วิธีเดียวกัน)
+  const inkT = new cv.Mat();
+  cv.transpose(ink, inkT);
+  ink.delete();
+  const cols = lineCurves(inkT, ah, aw, false).map((pts) => pts.map(([y, x]) => [x, y]));
+  inkT.delete();
+
+  // ตัวอย่างการเลื่อน: ณ ตำแหน่งปลายทาง (เส้นตรง) ต้องไปดึงพิกเซลจากตำแหน่งเดิมที่ห่างเท่าไร
+  const dySamples = [];
+  for (const pts of rows) {
+    const c = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    const wgt = pts.length;
+    for (const [x, y] of pts) dySamples.push([x, c, y - c, wgt]);
+  }
+  const dxSamples = [];
+  for (const pts of cols) {
+    const c = pts.reduce((a, p) => a + p[0], 0) / pts.length;
+    const wgt = pts.length;
+    for (const [x, y] of pts) dxSamples.push([c, y, x - c, wgt]);
+  }
+  const fy = rows.length >= 3 ? fitField(dySamples, aw, ah) : null;
+  const fx = cols.length >= 2 ? fitField(dxSamples, aw, ah) : null;
+  if (!fy && !fx) return null;
+
+  // ตรวจความสมเหตุสมผล: เลื่อนน้อยมาก = ตรงอยู่แล้ว · เลื่อนมากเกิน = น่าจะจับผิด
+  let maxD = 0;
+  for (let gy = 0; gy <= 10; gy++) for (let gx = 0; gx <= 10; gx++) {
+    const x = (gx / 10) * aw, y = (gy / 10) * ah;
+    maxD = Math.max(maxD, Math.abs(fy ? fy(x, y) : 0), Math.abs(fx ? fx(x, y) : 0));
+  }
+  if (maxD < 1.2 || maxD > 0.07 * Math.max(aw, ah)) return null;
+
+  // คำนวณการเลื่อนบนตารางหยาบ (ทุก 8 px ของภาพวิเคราะห์) แล้วขยายเป็นความละเอียดจริงแบบนุ่มนวล
+  const gw = Math.max(2, Math.ceil(aw / 8) + 1), gh = Math.max(2, Math.ceil(ah / 8) + 1);
+  const gdx = new cv.Mat(gh, gw, cv.CV_32FC1), gdy = new cv.Mat(gh, gw, cv.CV_32FC1);
+  const rowY = fy?.rowEval, rowX = fx?.rowEval;
+  for (let j = 0; j < gh; j++) {
+    const y = (j / (gh - 1)) * ah;
+    const ey = rowY ? rowY(y) : null, ex = rowX ? rowX(y) : null;
+    for (let i = 0; i < gw; i++) {
+      const x = (i / (gw - 1)) * aw;
+      gdx.data32F[j * gw + i] = ex ? ex(x) / s : 0;
+      gdy.data32F[j * gw + i] = ey ? ey(x) / s : 0;
+    }
+  }
+  const mapX = new cv.Mat(), mapY = new cv.Mat();
+  cv.resize(gdx, mapX, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
+  cv.resize(gdy, mapY, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
+  gdx.delete();
+  gdy.delete();
+  const mx = mapX.data32F, my = mapY.data32F;
+  for (let y = 0, i = 0; y < H; y++) {
+    for (let x = 0; x < W; x++, i++) {
+      mx[i] += x;
+      my[i] += y;
+    }
+  }
+  const out = new cv.Mat();
+  cv.remap(src, out, mapX, mapY, cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
+  mapX.delete();
+  mapY.delete();
+  return out;
+}
+
+/**
+ * หาเส้นแนวนอนยาว ๆ ในภาพขาวดำ (หมึก = 255) คืนจุดกึ่งกลางเส้นตามแนวยาว [[x, y], ...] ต่อเส้น
+ * joinText = เชื่อมตัวอักษรในบรรทัดให้เป็นแถบเดียวก่อน (ใช้กับแนวนอน)
+ */
+function lineCurves(bin, w, h, joinText) {
+  const m = new cv.Mat();
+  // หนาขึ้นเล็กน้อยในแนวตั้ง: เส้นที่เอียง/โค้งจะยังต่อกันเป็นแถวยาว
+  const k0 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, 3));
+  cv.dilate(bin, m, k0);
+  k0.delete();
+  if (joinText) {
+    const k1 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(Math.max(3, Math.round(w / 60)), 1));
+    cv.morphologyEx(m, m, cv.MORPH_CLOSE, k1);
+    k1.delete();
+  }
+  const k2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(Math.max(5, Math.round(w / 14)), 1));
+  cv.morphologyEx(m, m, cv.MORPH_OPEN, k2);
+  k2.delete();
+
+  const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+  const n = cv.connectedComponentsWithStats(m, labels, stats, cents, 8, cv.CV_32S);
+  m.delete();
+  cents.delete();
+  const L = labels.data32S, S = stats.data32S;
+  const step = Math.max(4, Math.round(w / 80));
+  const curves = [];
+  for (let l = 1; l < n; l++) {
+    const left = S[l * 5], top = S[l * 5 + 1], bw = S[l * 5 + 2], bh = S[l * 5 + 3], area = S[l * 5 + 4];
+    // ยาวพอ · ไม่หนาเกิน (ไม่ใช่ก้อนดำใหญ่) · ความสูงรวมไม่เกินช่วงโค้งที่เป็นไปได้
+    if (bw < 0.3 * w || bh > 0.12 * h || area / bw > 0.035 * h) continue;
+    const pts = [];
+    for (let x = left; x < left + bw; x += step) {
+      let sy = 0, c = 0;
+      for (let y = top; y < top + bh; y++) if (L[y * w + x] === l) { sy += y; c++; }
+      if (c) pts.push([x, sy / c]);
+    }
+    if (pts.length >= 6) curves.push(pts);
+  }
+  labels.delete();
+  stats.delete();
+  return curves;
+}
+
+/**
+ * ฟิตสนามการเลื่อน d(x, y) ด้วยพหุนามเรียบ (x กำลัง ≤ 4, y กำลัง ≤ 3) แบบตัดค่าผิดปกติ
+ * samples = [[x, y, d, weight]] ในพิกัดภาพวิเคราะห์ (aw × ah)
+ * คืนฟังก์ชัน f(x, y) และ f.rowEval(y) → (x) => d สำหรับคำนวณทีละแถวอย่างเร็ว
+ * นอกช่วงที่มีตัวอย่างจะใช้ค่าที่ขอบช่วง (ไม่ยืดเกินจริง)
+ */
+function fitField(samples, aw, ah) {
+  if (samples.length < 20) return null;
+  const NX = 5, NY = 4, K = NX * NY;
+  const nx = (x) => (x / aw) * 2 - 1, ny = (y) => (y / ah) * 2 - 1;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const [x, y] of samples) { x0 = Math.min(x0, nx(x)); x1 = Math.max(x1, nx(x)); y0 = Math.min(y0, ny(y)); y1 = Math.max(y1, ny(y)); }
+  const cx = (v) => Math.min(x1, Math.max(x0, v)), cy = (v) => Math.min(y1, Math.max(y0, v));
+  const powers = (v, N) => { const p = new Array(N); p[0] = 1; for (let i = 1; i < N; i++) p[i] = p[i - 1] * v; return p; };
+  const basis = (X, Y) => {
+    const px = powers(X, NX), py = powers(Y, NY), b = new Array(K);
+    for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) b[j * NX + i] = px[i] * py[j];
+    return b;
+  };
+  const rowsB = samples.map(([x, y]) => basis(cx(nx(x)), cy(ny(y))));
+  let w = samples.map((smp) => smp[3]);
+  let coef = null;
+  for (let iter = 0; iter < 3; iter++) {
+    const A = Array.from({ length: K }, () => new Float64Array(K));
+    const b = new Float64Array(K);
+    for (let r = 0; r < samples.length; r++) {
+      if (!w[r]) continue;
+      const B = rowsB[r], d = samples[r][2], wr = w[r];
+      for (let i = 0; i < K; i++) {
+        b[i] += wr * B[i] * d;
+        for (let j = 0; j < K; j++) A[i][j] += wr * B[i] * B[j];
+      }
+    }
+    let tr = 0;
+    for (let i = 0; i < K; i++) tr += A[i][i];
+    for (let i = 0; i < K; i++) A[i][i] += 1e-4 * tr / K; // กันสมการไม่มีคำตอบเดียว
+    coef = solve(A, b);
+    if (!coef) return null;
+    // ตัดตัวอย่างที่ห่างจากเส้นที่ฟิตได้มากผิดปกติ แล้วฟิตใหม่
+    const res = samples.map((smp, r) => Math.abs(rowsB[r].reduce((a, v, i) => a + v * coef[i], 0) - smp[2]));
+    const sorted = res.filter((_, r) => w[r]).sort((p, q) => p - q);
+    const med = sorted[sorted.length >> 1] || 0;
+    const cut = Math.max(1.5, 3 * med);
+    w = w.map((wr, r) => (res[r] > cut ? 0 : samples[r][3]));
+  }
+  const f = (x, y) => basis(cx(nx(x)), cy(ny(y))).reduce((a, v, i) => a + v * coef[i], 0);
+  f.rowEval = (y) => {
+    // รวมพจน์ของ y ไว้ก่อน เหลือพหุนามของ x ต่อแถว
+    const py = powers(cy(ny(y)), NY), cxs = new Float64Array(NX);
+    for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) cxs[i] += coef[j * NX + i] * py[j];
+    return (x) => {
+      const X = cx(nx(x));
+      let v = 0;
+      for (let i = NX - 1; i >= 0; i--) v = v * X + cxs[i];
+      return v;
+    };
+  };
+  return f;
+}
+
+/** แก้ระบบสมการเชิงเส้นด้วย Gaussian elimination (pivot บางส่วน) */
+function solve(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = c + 1; r < n; r++) {
+      const k = M[r][c] / M[c][c];
+      for (let j = c; j <= n; j++) M[r][j] -= k * M[c][j];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let v = M[r][n];
+    for (let j = r + 1; j < n; j++) v -= M[r][j] * x[j];
+    x[r] = v / M[r][r];
+  }
+  return x;
 }
 
 function applyFilter(rgba, filter, contrast) {

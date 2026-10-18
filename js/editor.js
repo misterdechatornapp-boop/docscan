@@ -19,10 +19,11 @@ export const FILTERS = [
  * @param {string} o.filter
  * @param {number} [o.rotation]
  * @param {number} [o.contrast] 0..1
+ * @param {boolean} [o.straighten] ดัดเส้นตาราง/บรรทัดที่โค้งให้ตรง
  * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
  * @returns {Promise<{corners, mids, filter, rotation, contrast, cont}|null>} cont = กด "บันทึก + ถ่ายต่อ"
  */
-export function openEditor({ canvas, corners, mids = null, filter, rotation = 0, contrast = 0.5, onContinue }) {
+export function openEditor({ canvas, corners, mids = null, filter, rotation = 0, contrast = 0.5, straighten = true, onContinue }) {
   const dlg = document.createElement('dialog');
   dlg.className = 'editor';
   dlg.setAttribute('aria-label', 'ปรับภาพเอกสาร');
@@ -56,6 +57,7 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       <div class="ed-stage ed-preview"><div class="spinner"></div></div>
       <div class="ed-filters">
         ${FILTERS.map((f) => `<button type="button" class="chip" data-filter="${f.id}">${esc(f.label)}</button>`).join('')}
+        <button type="button" class="chip chip-toggle" data-act="straighten" aria-pressed="${straighten}">${icon('lines')}ดัดเส้นให้ตรง</button>
       </div>
       <div class="ed-contrast">
         <label for="ed-contrast">คอนทราสต์</label>
@@ -86,6 +88,7 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     filter,
     rotation,
     contrast,
+    straighten,
   };
 
   state.mids = mids ? mids.map((p) => [...p]) : chordMids(state.corners);
@@ -273,6 +276,11 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       else if (act === 'back') showStep(1);
       else if (act === 'auto') autoDetect();
       else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); state.mids = chordMids(state.corners); setStatus(''); }
+      else if (act === 'straighten') {
+        state.straighten = !state.straighten;
+        e.target.closest('[data-act]').setAttribute('aria-pressed', String(state.straighten));
+        renderPreview();
+      }
       else if (act === 'rotL') { state.rotation = (state.rotation + 270) % 360; renderPreview(); }
       else if (act === 'rotR') { state.rotation = (state.rotation + 90) % 360; renderPreview(); }
       else if (act === 'save') finish({ ...result(), cont: false });

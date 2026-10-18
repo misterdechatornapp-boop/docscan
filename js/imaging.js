@@ -58,21 +58,48 @@ function getWorker() {
       if (ok) p.resolve(result);
       else p.reject(new Error(error));
     };
-    worker.onerror = (e) => {
-      for (const p of pending.values()) p.reject(new Error(e.message || 'worker error'));
-      pending.clear();
-      worker = null;
-    };
+    worker.onerror = (e) => resetWorker('ตัวประมวลผลภาพหยุดทำงาน' + (e.message ? ` (${e.message})` : ''));
   }
   return worker;
 }
 
+/** ปิด worker ที่เสีย แล้วแจ้งงานที่ค้างอยู่ทั้งหมด · ครั้งหน้าจะสร้างใหม่อัตโนมัติ */
+function resetWorker(reason) {
+  worker?.terminate();
+  worker = null;
+  for (const p of pending.values()) p.reject(Object.assign(new Error(reason), { crashed: true }));
+  pending.clear();
+}
+
+// เวลารอสูงสุดต่องาน: บน iPhone ถ้าหน่วยความจำไม่พอ worker อาจเงียบหายไปเลยโดยไม่แจ้ง error
+const TIMEOUT = { init: 60000, detect: 20000, process: 60000 };
+
 function call(type, payload = {}, transfer = []) {
   const id = ++seq;
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    const timer = setTimeout(() => {
+      if (pending.has(id)) resetWorker('ตัวประมวลผลภาพไม่ตอบสนอง');
+    }, TIMEOUT[type] || 60000);
+    const done = (fn) => (v) => { clearTimeout(timer); fn(v); };
+    pending.set(id, { resolve: done(resolve), reject: done(reject) });
     getWorker().postMessage({ id, type, ...payload }, transfer);
+  }).catch((err) => {
+    // OpenCV ล้มภายใน (เช่น หน่วยความจำเต็ม) ทำให้ worker ใช้ต่อไม่ได้ → เริ่มใหม่
+    if (!err.crashed && /abort|memory|oom/i.test(err.message)) resetWorker(err.message);
+    throw Object.assign(err, { crashed: err.crashed || /abort|memory|oom/i.test(err.message) });
   });
+}
+
+/** เรียกงานหนัก: ถ้า worker ล้มกลางทาง เริ่ม worker ใหม่แล้วลองอีกครั้งเดียว */
+async function callWithRetry(type, makePayload) {
+  try {
+    const p = makePayload();
+    return await call(type, p, [p.image.data]);
+  } catch (err) {
+    if (!err.crashed) throw err;
+    const p = makePayload();
+    return call(type, p, [p.image.data]);
+  }
 }
 
 function imagePayload(canvas) {
@@ -86,19 +113,22 @@ export const warmup = () => call('init');
 /** หาขอบกระดาษ คืน { corners, mids } แบบสัดส่วน 0..1 หรือ null · mids = จุดกลางขอบที่โค้ง (null = ขอบตรง) */
 export async function detectPage(canvas) {
   const small = scaleCanvas(canvas, 640);
-  const image = imagePayload(small);
-  freeCanvas(small);
-  return call('detect', { image }, [image.data]);
+  try {
+    return await callWithRetry('detect', () => ({ image: imagePayload(small) }));
+  } finally {
+    freeCanvas(small);
+  }
 }
 
 /** หาเฉพาะมุม 4 จุด (ใช้กับกรอบสดในกล้อง) */
 export const detectCorners = async (canvas) => (await detectPage(canvas))?.corners ?? null;
 
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5 }) {
-  const image = imagePayload(canvas);
+export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5, straighten = false }) {
   const plain = isFullFrame(corners) && !mids;
-  const r = await call('process', { image, corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast }, [image.data]);
+  const r = await callWithRetry('process', () => ({
+    image: imagePayload(canvas), corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast, straighten,
+  }));
   const out = document.createElement('canvas');
   out.width = r.w;
   out.height = r.h;

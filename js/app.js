@@ -9,7 +9,7 @@ import { openCameraView, cameraSupported } from './camera.js';
 import Sortable from '../vendor/sortable.esm.js';
 import { VERSION, APP_NAME, TRASH_DAYS } from './config.js';
 
-const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
+const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, straighten: true, camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
 let settings = { ...DEFAULT_SETTINGS };
 
 const app = $('#app');
@@ -46,7 +46,14 @@ const currentFolderId = () => parseRoute().folderId || null;
 let sortable = null;
 let searchQuery = '';
 
-async function route() {
+// วาดหน้าทีละครั้งตามลำดับ: หน้าที่สั่งทีหลังวาดทีหลังเสมอ (กันหน้าเก่าวาดทับหน้าใหม่)
+let routing = Promise.resolve();
+function route() {
+  routing = routing.then(renderRoute, renderRoute);
+  return routing;
+}
+
+async function renderRoute() {
   const r = parseRoute();
   releaseUrls();
   if (r.view !== 'doc') selection = null;
@@ -107,6 +114,7 @@ async function buildPage(docId, srcCanvas, opts, existing) {
     processed, thumb,
     corners: opts.corners, mids: opts.mids || null,
     filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5,
+    straighten: !!opts.straighten,
     needsReview: !!opts.needsReview,
   });
   await db.put('pages', page);
@@ -155,7 +163,7 @@ async function openCamera(docId) {
         .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
     },
     onShot: async (canvas) => {
-      const r = await openEditor({ canvas, filter: settings.filter, contrast: settings.contrast, onContinue: () => {} });
+      const r = await openEditor({ canvas, filter: settings.filter, contrast: settings.contrast, straighten: settings.straighten, onContinue: () => {} });
       if (!r) { freeCanvas(canvas); return 'cancel'; }
       rememberLook(r);
       saved++;
@@ -192,6 +200,7 @@ async function autoPage(docId, blob, folderId) {
       mids: found?.mids || null,
       filter: settings.filter,
       contrast: settings.contrast,
+      straighten: settings.straighten,
       rotation: 0,
       needsReview: !found,
     });
@@ -204,8 +213,8 @@ async function autoPage(docId, blob, folderId) {
 
 /** จำฟิลเตอร์/คอนทราสต์ล่าสุดไว้ใช้กับภาพถัดไป */
 function rememberLook(r) {
-  if (settings.filter === r.filter && settings.contrast === r.contrast) return;
-  Object.assign(settings, { filter: r.filter, contrast: r.contrast });
+  if (settings.filter === r.filter && settings.contrast === r.contrast && settings.straighten === r.straighten) return;
+  Object.assign(settings, { filter: r.filter, contrast: r.contrast, straighten: r.straighten });
   db.setMeta('settings', settings);
 }
 
@@ -240,6 +249,7 @@ async function editAndSave(file, target, fromCamera) {
     canvas,
     filter: settings.filter,
     contrast: settings.contrast,
+    straighten: settings.straighten,
     onContinue: fromCamera ? () => openSystemCamera({ docId, folderId: target?.folderId }) : null,
   });
   if (!res) {
@@ -686,15 +696,19 @@ async function renderPage(docId, index) {
     if (act === 'back') go(`#/doc/${docId}`);
     else if (act === 'prev') location.replace(`#/doc/${docId}/page/${i - 1}`);
     else if (act === 'next') location.replace(`#/doc/${docId}/page/${i + 1}`);
-    else if (act === 'edit') await reEditPage(doc, page);
+    else if (act === 'edit') await pageAction(() => reEditPage(doc, page));
     else if (act === 'rotate') {
-      await withBusy(t, async () => {
-        const c = await loadCanvas(page.original);
-        await buildPage(docId, c, { corners: page.corners, mids: page.mids, filter: page.filter, contrast: page.contrast ?? 0.5, rotation: ((page.rotation || 0) + 90) % 360, needsReview: page.needsReview }, page);
-        freeCanvas(c);
-        await refreshDoc(doc);
+      await pageAction(async () => {
+        const prog = progress('กำลังหมุน…');
+        try {
+          const c = await loadCanvas(page.original);
+          await buildPage(docId, c, { ...pageLook(page), rotation: ((page.rotation || 0) + 90) % 360 }, page);
+          freeCanvas(c);
+          await refreshDoc(doc);
+        } finally {
+          prog.close();
+        }
       });
-      route();
     } else if (act === 'share') {
       const files = await buildJpgs([page], { name: `${doc.name}_หน้า${i + 1}`, quality: 'full' });
       if (canShareFiles(files)) await shareFiles(files, doc.name).catch((err) => toast('แชร์ไม่สำเร็จ: ' + err.message));
@@ -712,6 +726,28 @@ async function renderPage(docId, index) {
   };
 }
 
+/** ค่าการจัดหน้าเดิมของหน้า (ใช้คำนวณใหม่จากภาพต้นฉบับ) */
+const pageLook = (page) => ({
+  corners: page.corners, mids: page.mids, filter: page.filter, contrast: page.contrast ?? 0.5,
+  rotation: page.rotation || 0, straighten: page.straighten ?? false, needsReview: page.needsReview,
+});
+
+// กันกดซ้ำระหว่างทำงาน + แจ้ง error ให้เห็น + วาดหน้าใหม่ทุกครั้ง (ไม่ค้างหน้าเดิม)
+let pageBusy = false;
+async function pageAction(fn) {
+  if (pageBusy) return toast('กำลังทำงาน รอสักครู่…');
+  pageBusy = true;
+  try {
+    await fn();
+  } catch (err) {
+    console.error(err);
+    toast('ทำรายการไม่สำเร็จ: ' + (err?.message || err), { ms: 5000 });
+  } finally {
+    pageBusy = false;
+    route();
+  }
+}
+
 /** เปลี่ยนฟิลเตอร์หลายหน้าพร้อมกัน (คำนวณใหม่จากภาพต้นฉบับ ขอบ/การหมุนเดิม) */
 async function refilterPages(doc, ids, filter) {
   const prog = progress('กำลังปรับฟิลเตอร์…');
@@ -721,7 +757,7 @@ async function refilterPages(doc, ids, filter) {
       const page = await db.get('pages', ids[i]);
       if (!page) continue;
       const c = await loadCanvas(page.original);
-      await buildPage(doc.id, c, { corners: page.corners, mids: page.mids, filter, contrast: page.contrast ?? settings.contrast, rotation: page.rotation, needsReview: page.needsReview }, page);
+      await buildPage(doc.id, c, { ...pageLook(page), filter }, page);
       freeCanvas(c);
     }
     await refreshDoc(await db.get('docs', doc.id));
@@ -732,9 +768,16 @@ async function refilterPages(doc, ids, filter) {
 }
 
 async function reEditPage(doc, page) {
-  const canvas = await loadCanvas(page.original);
-  const res = await openEditor({ canvas, corners: page.corners, mids: page.mids, filter: page.filter, rotation: page.rotation, contrast: page.contrast ?? 0.5 });
-  if (res) {
+  const loading = progress('กำลังเปิดภาพ…');
+  let canvas;
+  try {
+    canvas = await loadCanvas(page.original);
+  } finally {
+    loading.close();
+  }
+  try {
+    const res = await openEditor({ canvas, ...pageLook(page) });
+    if (!res) return;
     const prog = progress('กำลังบันทึก…');
     try {
       await buildPage(doc.id, canvas, res, page);
@@ -742,9 +785,9 @@ async function reEditPage(doc, page) {
     } finally {
       prog.close();
     }
+  } finally {
+    freeCanvas(canvas);
   }
-  freeCanvas(canvas);
-  route();
 }
 
 /* ---------- ถังขยะ ---------- */
@@ -944,6 +987,11 @@ function registerServiceWorker() {
     location.reload();
   });
 }
+
+window.addEventListener('unhandledrejection', (e) => {
+  console.error(e.reason);
+  toast('เกิดข้อผิดพลาด: ' + (e.reason?.message || e.reason), { ms: 5000 });
+});
 
 async function init() {
   settings = { ...DEFAULT_SETTINGS, ...(await db.getMeta('settings', {})) };
