@@ -312,6 +312,7 @@ dialog {
   padding: 0;
 }
 dialog::backdrop { background: rgb(0 0 0 / .55); }
+dialog:focus { outline: none; }
 
 dialog.box {
   width: min(440px, calc(100vw - 32px));
@@ -679,3 +680,41 @@ dialog.camera::backdrop { background: #000; }
 .chip-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1.5px solid var(--line); }
 .chip-toggle .ic { width: 18px; height: 18px; }
 .chip-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: rgb(45 212 191 / .12); }
+
+/* แถบปรับภาพ 3 แถบ */
+.ed-contrast { flex-direction: column; align-items: stretch; gap: 0; padding-top: 2px; }
+.adj-row { display: flex; align-items: center; gap: 10px; }
+.adj-row label { width: 5.6em; flex: none; color: var(--muted); }
+.adj-row input { flex: 1; min-width: 0; accent-color: var(--accent); min-height: 30px; }
+.adj-row output { width: 2.4em; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.adj-reset { align-self: flex-end; min-height: 32px; padding: 0 8px; font-size: 13px; color: var(--muted); }
+.adj-reset .ic { width: 16px; height: 16px; }
+
+/* ---------- ลบข้อความ ---------- */
+.er-stage { background: #000; }
+.er-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; -webkit-user-select: none; user-select: none; }
+.er-hint { pointer-events: none; }
+.eraser .ed-top .icon-btn:disabled { opacity: .35; }
+.er-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px max(16px, env(safe-area-inset-right, 0px)) calc(var(--bottom) + 10px) max(16px, env(safe-area-inset-left, 0px));
+  background: var(--surface);
+  font-size: 14px;
+}
+.er-tools .seg button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.er-tools .seg .ic { width: 18px; height: 18px; }
+.er-colors { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.er-colors .label { margin: 0; }
+.swatch { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 4px 4px; border-radius: 999px; background: var(--surface-2); font-size: 13px; }
+.swatch::before { content: ""; width: 24px; height: 24px; border-radius: 50%; background: var(--c); border: 2px solid var(--line); }
+.swatch.active { outline: 2px solid var(--accent); }
+.toolbar .tool { min-width: 0; flex: 1; }
+
+@media (orientation: landscape) and (max-height: 540px) {
+  .eraser .ed-step { display: grid; grid-template-columns: minmax(0, 1fr) min(300px, 42vw); grid-template-rows: auto minmax(0, 1fr); }
+  .eraser .ed-top { grid-column: 1 / -1; }
+  .eraser .er-stage { grid-column: 1; grid-row: 2; }
+  .eraser .er-tools { grid-column: 2; grid-row: 2; justify-content: center; }
+}

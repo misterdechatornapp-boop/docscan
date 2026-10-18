@@ -1,7 +1,8 @@
-// กล้องในแอป: เปิดไฟฉายได้ และเห็นกรอบเอกสารสดขณะเล็ง
+// กล้องในแอป: เปิดไฟฉายได้ · ถ่ายต่อเนื่องหรือทีละหน้า · มีเสียงชัตเตอร์
 import { icon } from './icons.js';
 import { toast } from './ui.js';
 import { detectCorners, scaleCanvas, freeCanvas, toBlob } from './imaging.js';
+import { shutterSound } from './sound.js';
 
 export const cameraSupported = () => !!navigator.mediaDevices?.getUserMedia;
 
@@ -13,9 +14,10 @@ export const cameraSupported = () => !!navigator.mediaDevices?.getUserMedia;
  * @param {(canvas: HTMLCanvasElement) => Promise<'saved'|'done'|'cancel'>} o.onShot โหมดทีละหน้า: เปิดหน้าปรับภาพ/บันทึก
  * @param {(blob: Blob) => void} o.onBatchShot โหมดต่อเนื่อง: ส่งภาพไปจัดขอบ/บันทึกเบื้องหลัง
  * @param {Function} o.onSystemCamera เรียกทันทีในจังหวะแตะ เมื่อผู้ใช้เลือกกล้องของระบบ
+ * @param {boolean} [o.sound] เสียงชัตเตอร์
  * @returns {Promise<{error?: Error}>} เสร็จเมื่อปิดกล้อง
  */
-export async function openCameraView({ mode = 'batch', onModeChange, onShot, onBatchShot, onSystemCamera }) {
+export async function openCameraView({ mode = 'batch', onModeChange, onShot, onBatchShot, onSystemCamera, sound = true }) {
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -29,10 +31,10 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
 
   const dlg = document.createElement('dialog');
   dlg.className = 'camera';
+  dlg.tabIndex = -1;
   dlg.setAttribute('aria-label', 'กล้องถ่ายเอกสาร');
   dlg.innerHTML = `
     <video class="cam-video" playsinline muted autoplay></video>
-    <canvas class="cam-overlay"></canvas>
     <div class="cam-flash"></div>
     <header class="cam-top">
       <button type="button" class="cam-btn" data-act="close" aria-label="ปิดกล้อง">${icon('close')}</button>
@@ -53,7 +55,6 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
   document.body.appendChild(dlg);
 
   const video = dlg.querySelector('video');
-  const overlay = dlg.querySelector('.cam-overlay');
   const hint = dlg.querySelector('.cam-hint');
   const torchBtn = dlg.querySelector('[data-act="torch"]');
   const shutter = dlg.querySelector('[data-act="shoot"]');
@@ -79,54 +80,25 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
       img.hidden = false;
     }
   };
+  const flash = () => {
+    if (sound) shutterSound();
+    dlg.querySelector('.cam-flash').animate([{ opacity: 0.85 }, { opacity: 0 }], { duration: 220 });
+  };
 
-  /* ----- กรอบเอกสารสด ----- */
-  function videoRect() {
-    // ตำแหน่งภาพจริงบนจอ (video ใช้ object-fit: contain)
-    const W = overlay.clientWidth, H = overlay.clientHeight;
-    const vw = video.videoWidth, vh = video.videoHeight;
-    const s = Math.min(W / vw, H / vh);
-    return { s, x: (W - vw * s) / 2, y: (H - vh * s) / 2, vw, vh };
-  }
-
-  function drawQuad(corners) {
-    const dpr = devicePixelRatio || 1;
-    overlay.width = overlay.clientWidth * dpr;
-    overlay.height = overlay.clientHeight * dpr;
-    const ctx = overlay.getContext('2d');
-    ctx.clearRect(0, 0, overlay.width, overlay.height);
-    if (!corners) return;
-    const r = videoRect();
-    ctx.scale(dpr, dpr);
-    ctx.beginPath();
-    corners.forEach(([x, y], i) => {
-      const px = r.x + x * r.vw * r.s, py = r.y + y * r.vh * r.s;
-      if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
-    });
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(45, 212, 191, 0.18)';
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#2dd4bf';
-    ctx.stroke();
-  }
-
+  // บอกเพียงข้อความว่าเห็นกระดาษหรือยัง (ไม่วาดกรอบทับภาพ เพื่อให้ภาพกล้องลื่น)
   async function detectLoop() {
     if (closed) return;
     if (!busy && !detecting && video.videoWidth) {
       detecting = true;
       try {
-        const frame = grabFrame(640);
+        const frame = grabFrame(480);
         const corners = await detectCorners(frame);
         freeCanvas(frame);
-        if (!busy && !closed) {
-          drawQuad(corners);
-          hint.textContent = corners ? 'พบเอกสาร · กดถ่ายได้เลย' : 'เล็งให้เห็นกระดาษทั้งแผ่น';
-        }
+        if (!busy && !closed) hint.textContent = corners ? 'พบเอกสาร · กดถ่ายได้เลย' : 'เล็งให้เห็นกระดาษทั้งแผ่น';
       } catch { /* ข้ามรอบนี้ */ }
       detecting = false;
     }
-    setTimeout(detectLoop, 400);
+    setTimeout(detectLoop, 800);
   }
 
   function grabFrame(maxSide = Infinity) {
@@ -174,7 +146,7 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
         if (!video.videoWidth || shutter.disabled) return;
         shutter.disabled = true;
         const canvas = grabFrame();
-        dlg.querySelector('.cam-flash').animate([{ opacity: 0.85 }, { opacity: 0 }], { duration: 200 });
+        flash();
         const thumb = scaleCanvas(canvas, 120);
         const thumbUrl = thumb.toDataURL('image/jpeg', 0.6);
         freeCanvas(thumb);
@@ -187,14 +159,12 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
         job.finally(() => encoding.delete(job));
         bumpCount(thumbUrl);
         setTimeout(() => { shutter.disabled = false; }, 250);
-      }
-      else if (act === 'shoot') {
+      } else if (act === 'shoot') {
         if (!video.videoWidth) return;
         busy = true;
         shutter.disabled = true;
         const canvas = grabFrame();
-        dlg.querySelector('.cam-flash').animate([{ opacity: 0.85 }, { opacity: 0 }], { duration: 250 });
-        drawQuad(null);
+        flash();
         try {
           const next = await onShot(canvas);
           if (next === 'saved' || next === 'done') bumpCount();
@@ -208,6 +178,8 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
 
     setMode(mode);
     dlg.showModal();
+    // ไม่ให้ปุ่มแรกถูกเลือกค้าง (iPhone จะแสดงวงสีฟ้ารอบปุ่ม)
+    dlg.focus({ preventScroll: true });
     detectLoop();
   });
 }

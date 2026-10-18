@@ -162,7 +162,7 @@ function edgeMids(corners, contour) {
 
 /* ---------- ดัดภาพ + ฟิลเตอร์ ---------- */
 
-function process({ image, corners, mids, filter, rotation, contrast = 0.5, straighten = false }) {
+function process({ image, corners, mids, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
   let mat = toMat(image);
   if (corners) {
     const p = corners.map(([x, y]) => [x * image.w, y * image.h]);
@@ -208,7 +208,7 @@ function process({ image, corners, mids, filter, rotation, contrast = 0.5, strai
     if (flat) { mat.delete(); mat = flat; }
   }
 
-  mat = applyFilter(mat, filter, contrast);
+  mat = applyFilter(mat, { filter, contrast, brightness, sharpness });
 
   if (rotation) {
     const code = { 90: cv.ROTATE_90_CLOCKWISE, 180: cv.ROTATE_180, 270: cv.ROTATE_90_COUNTERCLOCKWISE }[rotation];
@@ -346,8 +346,14 @@ function straightenLines(src) {
     const wgt = pts.length;
     for (const [x, y] of pts) dxSamples.push([c, y, x - c, wgt]);
   }
-  const fy = rows.length >= 3 ? fitField(dySamples, aw, ah) : null;
-  const fx = cols.length >= 2 ? fitField(dxSamples, aw, ah) : null;
+  const spanOf = (curves, axis, size) => {
+    if (!curves.length) return 0;
+    const v = curves.map((pts) => pts.reduce((a, p) => a + p[axis], 0) / pts.length);
+    return (Math.max(...v) - Math.min(...v)) / size;
+  };
+  // เส้นแนวนอนอย่างน้อย 4 เส้น กระจายเกิน 40% ของความสูง · เส้นแนวตั้งอย่างน้อย 2 เส้น ห่างกันเกิน 40% ของความกว้าง
+  const fy = rows.length >= 4 && spanOf(rows, 1, ah) > 0.4 ? fitField(dySamples, aw, ah) : null;
+  const fx = cols.length >= 2 && spanOf(cols, 0, aw) > 0.4 ? fitField(dxSamples, aw, ah) : null;
   if (!fy && !fx) return null;
 
   // ตรวจความสมเหตุสมผล: เลื่อนน้อยมาก = ตรงอยู่แล้ว · เลื่อนมากเกิน = น่าจะจับผิด
@@ -415,16 +421,26 @@ function lineCurves(bin, w, h, joinText) {
   cents.delete();
   const L = labels.data32S, S = stats.data32S;
   const step = Math.max(4, Math.round(w / 80));
-  const curves = [];
+  // ผู้สมัคร: ยาวพอ · ความสูงรวมไม่เกินช่วงโค้งที่เป็นไปได้
+  const cand = [];
   for (let l = 1; l < n; l++) {
     const left = S[l * 5], top = S[l * 5 + 1], bw = S[l * 5 + 2], bh = S[l * 5 + 3], area = S[l * 5 + 4];
-    // ยาวพอ · ไม่หนาเกิน (ไม่ใช่ก้อนดำใหญ่) · ความสูงรวมไม่เกินช่วงโค้งที่เป็นไปได้
-    if (bw < 0.3 * w || bh > 0.12 * h || area / bw > 0.035 * h) continue;
+    if (bw < 0.3 * w || bh > 0.12 * h) continue;
+    cand.push({ l, left, top, bw, bh, thick: area / bw });
+  }
+  // ตัดแถบที่หนาผิดปกติ (หลายบรรทัดติดกันเพราะเครื่องหมายถูก/ลายมือคร่อม หรือก้อนดำใหญ่)
+  const thicks = cand.map((c) => c.thick).sort((p, q) => p - q);
+  const medThick = thicks[thicks.length >> 1] || 0;
+  const curves = [];
+  for (const { l, left, top, bw, bh, thick } of cand) {
+    if (thick > Math.max(2.2 * medThick, 4) || thick > 0.035 * h) continue;
     const pts = [];
+    const col = [];
     for (let x = left; x < left + bw; x += step) {
-      let sy = 0, c = 0;
-      for (let y = top; y < top + bh; y++) if (L[y * w + x] === l) { sy += y; c++; }
-      if (c) pts.push([x, sy / c]);
+      // ค่ากลางของแนวตั้งในคอลัมน์นี้ (ไม่ถูกหางตัวอักษร/ขีดที่ยื่นออกมาดึงเพี้ยน)
+      col.length = 0;
+      for (let y = top; y < top + bh; y++) if (L[y * w + x] === l) col.push(y);
+      if (col.length) pts.push([x, col[col.length >> 1]]);
     }
     if (pts.length >= 6) curves.push(pts);
   }
@@ -437,11 +453,13 @@ function lineCurves(bin, w, h, joinText) {
  * ฟิตสนามการเลื่อน d(x, y) ด้วยพหุนามเรียบ (x กำลัง ≤ 4, y กำลัง ≤ 3) แบบตัดค่าผิดปกติ
  * samples = [[x, y, d, weight]] ในพิกัดภาพวิเคราะห์ (aw × ah)
  * คืนฟังก์ชัน f(x, y) และ f.rowEval(y) → (x) => d สำหรับคำนวณทีละแถวอย่างเร็ว
- * นอกช่วงที่มีตัวอย่างจะใช้ค่าที่ขอบช่วง (ไม่ยืดเกินจริง)
+ * นอกช่วงที่มีตัวอย่าง ค่าการเลื่อนจะค่อย ๆ ลดเป็น 0 (ไม่เดาส่วนที่ไม่มีเส้นอ้างอิง)
+ * คืน null ถ้าการดัดไม่ทำให้เส้นตรงขึ้นชัดเจน
  */
 function fitField(samples, aw, ah) {
   if (samples.length < 20) return null;
-  const NX = 5, NY = 4, K = NX * NY;
+  // พหุนามดีกรีต่ำ: ความโค้งของกระดาษเป็นแบบเรียบ ๆ ทั้งแผ่น (ดีกรีสูงทำให้เส้นเป็นคลื่น)
+  const NX = 4, NY = 3, K = NX * NY;
   const nx = (x) => (x / aw) * 2 - 1, ny = (y) => (y / ah) * 2 - 1;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const [x, y] of samples) { x0 = Math.min(x0, nx(x)); x1 = Math.max(x1, nx(x)); y0 = Math.min(y0, ny(y)); y1 = Math.max(y1, ny(y)); }
@@ -478,16 +496,41 @@ function fitField(samples, aw, ah) {
     const cut = Math.max(1.5, 3 * med);
     w = w.map((wr, r) => (res[r] > cut ? 0 : samples[r][3]));
   }
-  const f = (x, y) => basis(cx(nx(x)), cy(ny(y))).reduce((a, v, i) => a + v * coef[i], 0);
+  // วัดว่าดัดแล้วช่วยจริงไหม: ความคลาดก่อนดัด (d) เทียบหลังดัด (d − ค่าที่ฟิตได้) เฉพาะตัวอย่างที่ใช้
+  let before = 0, after = 0, sw = 0;
+  samples.forEach((smp, r) => {
+    if (!w[r]) return;
+    const fit = rowsB[r].reduce((a, v, i) => a + v * coef[i], 0);
+    before += w[r] * smp[2] ** 2;
+    after += w[r] * (smp[2] - fit) ** 2;
+    sw += w[r];
+  });
+  before = Math.sqrt(before / sw);
+  after = Math.sqrt(after / sw);
+  if (before < 1 || after > 0.55 * before) return null;
+
+  // นอกช่วงที่มีเส้นอ้างอิง: ลดการเลื่อนลงจนเป็น 0 ภายในระยะ 15% ของหน้า
+  const FADE = 0.3; // หน่วยพิกัดปกติ (-1..1) = 15% ของหน้า
+  const fade = (v, lo, hi) => {
+    const out = v < lo ? lo - v : v > hi ? v - hi : 0;
+    const t = Math.max(0, 1 - out / FADE);
+    return t * t * (3 - 2 * t);
+  };
+  const f = (x, y) => {
+    const X = nx(x), Y = ny(y);
+    return basis(cx(X), cy(Y)).reduce((a, v, i) => a + v * coef[i], 0) * fade(X, x0, x1) * fade(Y, y0, y1);
+  };
   f.rowEval = (y) => {
     // รวมพจน์ของ y ไว้ก่อน เหลือพหุนามของ x ต่อแถว
-    const py = powers(cy(ny(y)), NY), cxs = new Float64Array(NX);
+    const Y = ny(y);
+    const py = powers(cy(Y), NY), cxs = new Float64Array(NX);
     for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) cxs[i] += coef[j * NX + i] * py[j];
+    const fy = fade(Y, y0, y1);
     return (x) => {
-      const X = cx(nx(x));
+      const X = nx(x), Xc = cx(X);
       let v = 0;
-      for (let i = NX - 1; i >= 0; i--) v = v * X + cxs[i];
-      return v;
+      for (let i = NX - 1; i >= 0; i--) v = v * Xc + cxs[i];
+      return v * fy * fade(X, x0, x1);
     };
   };
   return f;
@@ -516,41 +559,81 @@ function solve(A, b) {
   return x;
 }
 
-function applyFilter(rgba, filter, contrast) {
-  if (!filter || filter === 'original') return rgba;
+/**
+ * ฟิลเตอร์ + ปรับภาพ
+ * contrast 0..1 (0.5 = ปกติ) · brightness −1..1 (0 = ปกติ) · sharpness 0..1 (0 = ไม่เพิ่มความคม)
+ */
+function applyFilter(rgba, { filter, contrast, brightness = 0, sharpness = 0 }) {
   const rgb = new cv.Mat();
   cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
   rgba.delete();
+  if (!filter || filter === 'original') {
+    sharpen(rgb, sharpness);
+    tone(rgb, contrast, brightness);
+    return rgb;
+  }
   const flat = flattenLight(rgb);
   rgb.delete();
+  // เพิ่มความคมก่อนปรับระดับแสง: ขอบตัวหนังสือ/เส้นปากกาชัดขึ้นโดยพื้นยังขาว
+  sharpen(flat, sharpness);
   if (filter === 'color') {
-    levels(flat, contrast);
+    levels(flat, contrast, brightness);
     return flat;
   }
   const gray = new cv.Mat();
   cv.cvtColor(flat, gray, cv.COLOR_RGB2GRAY);
   flat.delete();
-  levels(gray, contrast);
-  if (filter === 'gray') return gray;
-  // ขาวดำคมชัด
+  if (filter === 'gray') {
+    levels(gray, contrast, brightness);
+    return gray;
+  }
+  // ขาวดำ: คอนทราสต์มาก = เก็บเส้นจาง ๆ ได้มากขึ้น · สว่างมาก = จุดดำเล็ก ๆ หายไป
+  levels(gray, 0.3 + contrast * 0.4, 0);
   let block = Math.round(Math.min(gray.cols, gray.rows) / 40);
   block = Math.max(15, block % 2 ? block : block + 1);
   const bw = new cv.Mat();
-  cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 10);
+  cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 10 + brightness * 8);
   gray.delete();
   return bw;
 }
 
 /**
- * ปรับระดับแสง: ค่าที่สว่างกว่าจุดขาวกลายเป็นขาวล้วน (เงาจาง ๆ ที่เหลือหายไป)
- * และค่าที่มืดกว่าจุดดำกลายเป็นดำ (ตัวหนังสือเข้มขึ้น) · contrast 0..1 (0.5 = ค่าเริ่มต้น)
+ * ปรับระดับแสงหลังลบเงา: ค่าที่สว่างกว่าจุดขาวกลายเป็นขาวล้วน (เงาจาง ๆ ที่เหลือหายไป)
+ * และค่าที่มืดกว่าจุดดำกลายเป็นดำ (ตัวหนังสือเข้มขึ้น) แล้วเลื่อนความสว่างทั้งภาพ
  */
-function levels(mat, contrast) {
+function levels(mat, contrast, brightness = 0) {
   const s = Math.min(1, Math.max(0, contrast));
   const lo = 15 + 70 * s;
   const hi = 250 - 75 * s;
   const lut = new Uint8Array(256);
-  for (let v = 0; v < 256; v++) lut[v] = Math.round(255 * Math.min(1, Math.max(0, (v - lo) / (hi - lo))));
+  for (let v = 0; v < 256; v++) lut[v] = clamp255(255 * (v - lo) / (hi - lo) + brightness * 60);
+  applyLut(mat, lut);
+}
+
+/** ภาพต้นฉบับ: คอนทราสต์แบบเส้นตรงรอบค่ากลาง + ความสว่าง */
+function tone(mat, contrast, brightness) {
+  const k = 0.6 + Math.min(1, Math.max(0, contrast)) * 0.8; // 0.5 → ×1.0
+  if (Math.abs(k - 1) < 0.01 && Math.abs(brightness) < 0.01) return;
+  const lut = new Uint8Array(256);
+  for (let v = 0; v < 256; v++) lut[v] = clamp255((v - 128) * k + 128 + brightness * 60);
+  applyLut(mat, lut);
+}
+
+/** เพิ่มความคมแบบ unsharp mask: ภาพ + (ภาพ − ภาพเบลอ) × น้ำหนัก */
+function sharpen(mat, amount) {
+  if (!(amount > 0.01)) return;
+  const sigma = Math.max(1, Math.min(mat.cols, mat.rows) / 1000);
+  const blur = new cv.Mat();
+  cv.GaussianBlur(mat, blur, new cv.Size(0, 0), sigma);
+  const a = amount * 1.6;
+  cv.addWeighted(mat, 1 + a, blur, -a, 0, mat);
+  blur.delete();
+}
+
+const clamp255 = (v) => Math.max(0, Math.min(255, Math.round(v)));
+
+/** ใช้ตารางค่ากับทุกช่องสี (ภาพในขั้นนี้ไม่มีช่องความโปร่งใส) */
+function applyLut(mat, lut) {
   const d = mat.data;
   for (let i = 0; i < d.length; i++) d[i] = lut[d[i]];
 }

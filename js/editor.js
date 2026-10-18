@@ -3,6 +3,15 @@ import { icon } from './icons.js';
 import { esc } from './ui.js';
 import { detectPage, processCanvas, scaleCanvas, freeCanvas, FULL_FRAME } from './imaging.js';
 
+/** ค่าปรับภาพเริ่มต้น (ปุ่ม "ค่าเริ่มต้น") */
+export const DEFAULT_LOOK = { contrast: 0.5, brightness: 0, sharpness: 0.3 };
+
+const ADJUST = [
+  { key: 'contrast', label: 'คอนทราสต์', min: 0, max: 100, scale: 100 },
+  { key: 'brightness', label: 'ความสว่าง', min: -50, max: 50, scale: 50 },
+  { key: 'sharpness', label: 'ความคมชัด', min: 0, max: 100, scale: 100 },
+];
+
 export const FILTERS = [
   { id: 'color', label: 'ปรับสี' },
   { id: 'gray', label: 'สีเทา' },
@@ -19,11 +28,13 @@ export const FILTERS = [
  * @param {string} o.filter
  * @param {number} [o.rotation]
  * @param {number} [o.contrast] 0..1
+ * @param {number} [o.brightness] −1..1
+ * @param {number} [o.sharpness] 0..1
  * @param {boolean} [o.straighten] ดัดเส้นตาราง/บรรทัดที่โค้งให้ตรง
  * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
  * @returns {Promise<{corners, mids, filter, rotation, contrast, cont}|null>} cont = กด "บันทึก + ถ่ายต่อ"
  */
-export function openEditor({ canvas, corners, mids = null, filter, rotation = 0, contrast = 0.5, straighten = true, onContinue }) {
+export function openEditor({ canvas, corners, mids = null, filter, rotation = 0, contrast = 0.5, brightness = 0, sharpness = DEFAULT_LOOK.sharpness, straighten = true, onContinue }) {
   const dlg = document.createElement('dialog');
   dlg.className = 'editor';
   dlg.setAttribute('aria-label', 'ปรับภาพเอกสาร');
@@ -60,9 +71,13 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
         <button type="button" class="chip chip-toggle" data-act="straighten" aria-pressed="${straighten}">${icon('lines')}ดัดเส้นให้ตรง</button>
       </div>
       <div class="ed-contrast">
-        <label for="ed-contrast">คอนทราสต์</label>
-        <input type="range" id="ed-contrast" min="0" max="100" step="1" value="${Math.round(contrast * 100)}">
-        <output class="ed-contrast-val">${Math.round(contrast * 100)}</output>
+        ${ADJUST.map((a) => `
+          <div class="adj-row">
+            <label for="adj-${a.key}">${a.label}</label>
+            <input type="range" id="adj-${a.key}" data-adj="${a.key}" min="${a.min}" max="${a.max}" step="1" value="${Math.round({ contrast, brightness, sharpness }[a.key] * a.scale)}">
+            <output>${Math.round({ contrast, brightness, sharpness }[a.key] * a.scale)}</output>
+          </div>`).join('')}
+        <button type="button" class="btn btn-ghost adj-reset" data-act="adj-reset">${icon('restore')}ค่าเริ่มต้น</button>
       </div>
       <footer class="ed-tools">
         <button type="button" class="tool" data-act="rotL">${icon('rotL')}<span>หมุนซ้าย</span></button>
@@ -88,6 +103,8 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     filter,
     rotation,
     contrast,
+    brightness,
+    sharpness,
     straighten,
   };
 
@@ -223,7 +240,6 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     const token = ++previewToken;
     previewBox.classList.add('loading');
     dlg.querySelectorAll('[data-filter]').forEach((b) => b.classList.toggle('active', b.dataset.filter === state.filter));
-    dlg.querySelector('.ed-contrast').hidden = state.filter === 'original';
     try {
       if (!previewSrc) previewSrc = scaleCanvas(canvas, 1400);
       const out = await processCanvas(previewSrc, result());
@@ -276,6 +292,11 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       else if (act === 'back') showStep(1);
       else if (act === 'auto') autoDetect();
       else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); state.mids = chordMids(state.corners); setStatus(''); }
+      else if (act === 'adj-reset') {
+        Object.assign(state, DEFAULT_LOOK);
+        syncAdjust();
+        renderPreview();
+      }
       else if (act === 'straighten') {
         state.straighten = !state.straighten;
         e.target.closest('[data-act]').setAttribute('aria-pressed', String(state.straighten));
@@ -286,19 +307,29 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       else if (act === 'save') finish({ ...result(), cont: false });
       else if (act === 'saveMore') { onContinue(); finish({ ...result(), cont: true }); }
     });
-    // ลากแถบคอนทราสต์: รอให้หยุดลากสักนิดค่อยคำนวณพรีวิวใหม่
-    let contrastTimer;
-    dlg.querySelector('#ed-contrast').addEventListener('input', (e) => {
-      state.contrast = Number(e.target.value) / 100;
-      dlg.querySelector('.ed-contrast-val').textContent = e.target.value;
-      clearTimeout(contrastTimer);
-      contrastTimer = setTimeout(renderPreview, 140);
+    // ลากแถบปรับภาพ: รอให้หยุดลากสักนิดค่อยคำนวณพรีวิวใหม่
+    let adjTimer;
+    const syncAdjust = () => ADJUST.forEach((a) => {
+      const input = dlg.querySelector(`#adj-${a.key}`);
+      input.value = Math.round(state[a.key] * a.scale);
+      input.nextElementSibling.textContent = input.value;
+    });
+    dlg.addEventListener('input', (e) => {
+      const key = e.target.dataset?.adj;
+      if (!key) return;
+      const a = ADJUST.find((x) => x.key === key);
+      state[key] = Number(e.target.value) / a.scale;
+      e.target.nextElementSibling.textContent = e.target.value;
+      clearTimeout(adjTimer);
+      adjTimer = setTimeout(renderPreview, 160);
     });
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
     dlg.addEventListener('close', () => finish(null));
 
     window.addEventListener('resize', layout);
+    dlg.tabIndex = -1;
     dlg.showModal();
+    dlg.focus({ preventScroll: true }); // ไม่ให้ปุ่มแรกมีวงสีฟ้าค้าง
     layout();
     render();
     if (!corners) autoDetect();

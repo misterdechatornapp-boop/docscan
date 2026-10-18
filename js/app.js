@@ -4,12 +4,19 @@ import { icon } from './icons.js';
 import { $, esc, modal, sheet, confirmBox, promptBox, toast, withBusy, progress, fmtDate, fmtSize } from './ui.js';
 import { loadCanvas, toBlob, freeCanvas, scaleCanvas, detectPage, processCanvas, warmup, FULL_FRAME, THUMB_SIDE } from './imaging.js';
 import { openEditor, FILTERS } from './editor.js';
+import { openEraser, drawStrokes, rotateStrokes } from './eraser.js';
+
+/** ค่าการปรับภาพล่าสุดที่ผู้ใช้เลือก (ใช้กับภาพถัดไป) */
+const lastLook = () => ({
+  filter: settings.filter, contrast: settings.contrast, brightness: settings.brightness,
+  sharpness: settings.sharpness, straighten: settings.straighten,
+});
 import { buildPdf, buildJpgs, canShareFiles, shareFiles, downloadFiles, QUALITIES } from './exporter.js';
 import { openCameraView, cameraSupported } from './camera.js';
 import Sortable from '../vendor/sortable.esm.js';
 import { VERSION, APP_NAME, TRASH_DAYS } from './config.js';
 
-const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, straighten: true, camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
+const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, brightness: 0, sharpness: 0.3, straighten: true, sound: 'on', camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
 let settings = { ...DEFAULT_SETTINGS };
 
 const app = $('#app');
@@ -104,6 +111,7 @@ async function appendPages(docId, pages, folderId) {
 /** ประมวลผลภาพจริง (ความละเอียดเต็ม) แล้วเก็บเป็นหน้าใหม่หรือทับหน้าเดิม */
 async function buildPage(docId, srcCanvas, opts, existing) {
   const out = await processCanvas(srcCanvas, opts);
+  if (opts.erase?.length) drawStrokes(out.getContext('2d'), out.width, out.height, opts.erase);
   const processed = await toBlob(out, 0.85);
   const thumbCanvas = scaleCanvas(out, THUMB_SIDE);
   const thumb = await toBlob(thumbCanvas, 0.7);
@@ -114,7 +122,9 @@ async function buildPage(docId, srcCanvas, opts, existing) {
     processed, thumb,
     corners: opts.corners, mids: opts.mids || null,
     filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5,
+    brightness: opts.brightness ?? 0, sharpness: opts.sharpness ?? 0,
     straighten: !!opts.straighten,
+    erase: opts.erase || [],
     needsReview: !!opts.needsReview,
   });
   await db.put('pages', page);
@@ -155,6 +165,7 @@ async function openCamera(docId) {
   let saved = 0;
   const res = await openCameraView({
     mode: settings.camMode,
+    sound: settings.sound !== 'off',
     onModeChange: (m) => { settings.camMode = m; db.setMeta('settings', settings); },
     onSystemCamera: () => openSystemCamera(target),
     onBatchShot: (blob) => {
@@ -163,7 +174,7 @@ async function openCamera(docId) {
         .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
     },
     onShot: async (canvas) => {
-      const r = await openEditor({ canvas, filter: settings.filter, contrast: settings.contrast, straighten: settings.straighten, onContinue: () => {} });
+      const r = await openEditor({ canvas, ...lastLook(), onContinue: () => {} });
       if (!r) { freeCanvas(canvas); return 'cancel'; }
       rememberLook(r);
       saved++;
@@ -198,9 +209,7 @@ async function autoPage(docId, blob, folderId) {
     const page = await buildPage(docId, c, {
       corners: found?.corners || FULL_FRAME,
       mids: found?.mids || null,
-      filter: settings.filter,
-      contrast: settings.contrast,
-      straighten: settings.straighten,
+      ...lastLook(),
       rotation: 0,
       needsReview: !found,
     });
@@ -213,8 +222,9 @@ async function autoPage(docId, blob, folderId) {
 
 /** จำฟิลเตอร์/คอนทราสต์ล่าสุดไว้ใช้กับภาพถัดไป */
 function rememberLook(r) {
-  if (settings.filter === r.filter && settings.contrast === r.contrast && settings.straighten === r.straighten) return;
-  Object.assign(settings, { filter: r.filter, contrast: r.contrast, straighten: r.straighten });
+  const keys = ['filter', 'contrast', 'brightness', 'sharpness', 'straighten'];
+  if (keys.every((k) => settings[k] === r[k])) return;
+  for (const k of keys) settings[k] = r[k];
   db.setMeta('settings', settings);
 }
 
@@ -227,8 +237,47 @@ function openGallery(docId) {
 
 camInput.addEventListener('change', () => {
   const f = camInput.files[0];
-  if (f) editAndSave(f, camTarget, true);
+  if (!f) return;
+  if (settings.camMode === 'batch') systemBatchShot(f, camTarget);
+  else editAndSave(f, camTarget, true);
 });
+
+/**
+ * กล้องของระบบ + โหมดต่อเนื่อง: เก็บภาพทันที (จัดขอบ/ฟิลเตอร์อัตโนมัติเบื้องหลัง)
+ * แล้วถามว่าถ่ายหน้าถัดไปไหม — ปุ่ม "ถ่ายหน้าถัดไป" เปิดกล้องในจังหวะแตะ (iOS ต้องการแบบนี้)
+ */
+async function systemBatchShot(file, target) {
+  target.count = (target.count || 0) + 1;
+  enqueue(() => autoPage(target.docId, file, target.folderId))
+    .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
+  const next = await modal(`
+    <h2>ถ่ายแล้ว ${target.count} หน้า</h2>
+    <p class="muted">แอปจัดขอบและปรับสีให้เองเบื้องหลัง ไปแก้ทีหลังได้ในหน้าเอกสาร</p>
+    <div class="dlg-actions">
+      <button type="button" class="btn" data-v="done">เสร็จ</button>
+      <button type="button" class="btn btn-primary" data-v="more">${icon('camera')}ถ่ายหน้าถัดไป</button>
+    </div>`, {
+    cls: 'box', label: 'ถ่ายต่อ',
+    setup(dlg, finish) {
+      dlg.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-v]');
+        if (!b) return;
+        if (b.dataset.v === 'more') openSystemCamera(target);
+        finish(b.dataset.v);
+      });
+    },
+  });
+  if (next !== 'more') {
+    const prog = progress('กำลังจัดขอบและบันทึก…');
+    await queue;
+    prog.close();
+  } else {
+    await queue;
+  }
+  // ไปหน้าเอกสาร (ถ้ากดถ่ายต่อแล้วยกเลิกกล้อง ก็จะเห็นหน้าเอกสารพอดี)
+  if (parseRoute().view === 'doc' && parseRoute().docId === target.docId) route();
+  else go(`#/doc/${target.docId}`);
+}
 
 galInput.addEventListener('change', () => {
   const files = [...galInput.files];
@@ -247,9 +296,7 @@ async function editAndSave(file, target, fromCamera) {
   }
   const res = await openEditor({
     canvas,
-    filter: settings.filter,
-    contrast: settings.contrast,
-    straighten: settings.straighten,
+    ...lastLook(),
     onContinue: fromCamera ? () => openSystemCamera({ docId, folderId: target?.folderId }) : null,
   });
   if (!res) {
@@ -673,6 +720,7 @@ async function renderPage(docId, index) {
     <footer class="toolbar">
       <button class="tool" data-act="edit">${icon('crop')}<span>ขอบ/ฟิลเตอร์</span></button>
       <button class="tool" data-act="rotate">${icon('rotR')}<span>หมุน</span></button>
+      <button class="tool" data-act="erase">${icon('eraser')}<span>ลบข้อความ</span></button>
       <button class="tool" data-act="share">${icon('share')}<span>แชร์หน้านี้</span></button>
       <button class="tool danger" data-act="delete">${icon('trash')}<span>ลบหน้า</span></button>
     </footer>`;
@@ -702,13 +750,15 @@ async function renderPage(docId, index) {
         const prog = progress('กำลังหมุน…');
         try {
           const c = await loadCanvas(page.original);
-          await buildPage(docId, c, { ...pageLook(page), rotation: ((page.rotation || 0) + 90) % 360 }, page);
+          await buildPage(docId, c, { ...pageLook(page), rotation: ((page.rotation || 0) + 90) % 360, erase: rotateStrokes(page.erase || [], 90) }, page);
           freeCanvas(c);
           await refreshDoc(doc);
         } finally {
           prog.close();
         }
       });
+    } else if (act === 'erase') {
+      await pageAction(() => erasePage(doc, page));
     } else if (act === 'share') {
       const files = await buildJpgs([page], { name: `${doc.name}_หน้า${i + 1}`, quality: 'full' });
       if (canShareFiles(files)) await shareFiles(files, doc.name).catch((err) => toast('แชร์ไม่สำเร็จ: ' + err.message));
@@ -729,7 +779,9 @@ async function renderPage(docId, index) {
 /** ค่าการจัดหน้าเดิมของหน้า (ใช้คำนวณใหม่จากภาพต้นฉบับ) */
 const pageLook = (page) => ({
   corners: page.corners, mids: page.mids, filter: page.filter, contrast: page.contrast ?? 0.5,
+  brightness: page.brightness ?? 0, sharpness: page.sharpness ?? 0,
   rotation: page.rotation || 0, straighten: page.straighten ?? false, needsReview: page.needsReview,
+  erase: page.erase || [],
 });
 
 // กันกดซ้ำระหว่างทำงาน + แจ้ง error ให้เห็น + วาดหน้าใหม่ทุกครั้ง (ไม่ค้างหน้าเดิม)
@@ -767,6 +819,36 @@ async function refilterPages(doc, ids, filter) {
   }
 }
 
+/** ลบข้อความ: เปิดหน้าระบาย แล้วคำนวณหน้าใหม่จากต้นฉบับพร้อมรอยลบ */
+async function erasePage(doc, page) {
+  const loading = progress('กำลังเปิดภาพ…');
+  let base;
+  try {
+    // ภาพฐานที่ยังไม่มีรอยลบ (รอยเดิมแก้/ย้อนกลับได้)
+    if (page.erase?.length) {
+      const c = await loadCanvas(page.original);
+      base = await processCanvas(c, { ...pageLook(page), erase: [] });
+      freeCanvas(c);
+    } else {
+      base = await loadCanvas(page.processed, Infinity);
+    }
+  } finally {
+    loading.close();
+  }
+  const strokes = await openEraser({ image: base, strokes: page.erase || [] });
+  freeCanvas(base);
+  if (!strokes) return;
+  const prog = progress('กำลังบันทึก…');
+  try {
+    const c = await loadCanvas(page.original);
+    await buildPage(doc.id, c, { ...pageLook(page), erase: strokes }, page);
+    freeCanvas(c);
+    await refreshDoc(doc);
+  } finally {
+    prog.close();
+  }
+}
+
 async function reEditPage(doc, page) {
   const loading = progress('กำลังเปิดภาพ…');
   let canvas;
@@ -778,9 +860,15 @@ async function reEditPage(doc, page) {
   try {
     const res = await openEditor({ canvas, ...pageLook(page) });
     if (!res) return;
+    let erase = page.erase || [];
+    if (erase.length) {
+      const same = JSON.stringify([res.corners, res.mids, res.straighten]) === JSON.stringify([page.corners, page.mids ?? null, page.straighten ?? false]);
+      if (same) erase = rotateStrokes(erase, (res.rotation || 0) - (page.rotation || 0));
+      else { erase = []; toast('ล้างรอยลบข้อความแล้ว เพราะเปลี่ยนขอบภาพ', { ms: 4000 }); }
+    }
     const prog = progress('กำลังบันทึก…');
     try {
-      await buildPage(doc.id, canvas, res, page);
+      await buildPage(doc.id, canvas, { ...res, erase }, page);
       await refreshDoc(doc);
     } finally {
       prog.close();
@@ -945,6 +1033,8 @@ async function openSettings() {
   const html = `
     <h2>ตั้งค่า</h2>
     <div class="field"><span class="label">กล้อง</span>${seg('camera', [['app', 'กล้องในแอป (มีไฟฉาย)'], ['system', 'กล้องของระบบ']], settings.camera)}</div>
+    <div class="field"><span class="label">ถ่ายหลายหน้า</span>${seg('camMode', [['batch', 'ต่อเนื่อง (จัดทีหลัง)'], ['single', 'ปรับทีละหน้า']], settings.camMode)}</div>
+    <div class="field"><span class="label">เสียงชัตเตอร์ (กล้องในแอป)</span>${seg('sound', [['on', 'เปิด'], ['off', 'ปิด']], settings.sound)}</div>
     <div class="field"><span class="label">ฟิลเตอร์เริ่มต้น</span>${seg('filter', FILTERS.map((f) => [f.id, f.label]), settings.filter)}</div>
     <div class="field"><span class="label">ขนาดหน้า PDF</span>${seg('pageSize', [['a4', 'A4'], ['fit', 'ตามภาพ']], settings.pageSize)}</div>
     <div class="field"><span class="label">ขนาดไฟล์ส่งออก</span>${seg('quality', Object.entries(QUALITIES).map(([k, q]) => [k, q.label]), settings.quality)}</div>

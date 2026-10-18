@@ -36,8 +36,10 @@ export function modal(html, { cls = '', label = '', setup } = {}) {
       resolve(value);
     };
     dlg.addEventListener('close', () => finish(null));
-    setup?.(dlg, finish);
+    dlg.tabIndex = -1;
     dlg.showModal();
+    dlg.focus({ preventScroll: true }); // ไม่ให้ปุ่มแรกมีวงสีฟ้าค้าง (ช่องกรอกจะได้โฟกัสเองใน setup)
+    setup?.(dlg, finish);
   });
 }
 

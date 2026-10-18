@@ -124,10 +124,10 @@ export async function detectPage(canvas) {
 export const detectCorners = async (canvas) => (await detectPage(canvas))?.corners ?? null;
 
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5, straighten = false }) {
+export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
   const plain = isFullFrame(corners) && !mids;
   const r = await callWithRetry('process', () => ({
-    image: imagePayload(canvas), corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast, straighten,
+    image: imagePayload(canvas), corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast, brightness, sharpness, straighten,
   }));
   const out = document.createElement('canvas');
   out.width = r.w;
