@@ -120,7 +120,7 @@ async function buildPage(docId, srcCanvas, opts, existing) {
   const page = existing || { id: db.uid(), docId, createdAt: Date.now(), original: await toBlob(srcCanvas, 0.9) };
   Object.assign(page, {
     processed, thumb,
-    corners: opts.corners, mids: opts.mids || null,
+    corners: opts.corners, mids: null,
     filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5,
     brightness: opts.brightness ?? 0, sharpness: opts.sharpness ?? 0,
     straighten: !!opts.straighten,
@@ -208,7 +208,6 @@ async function autoPage(docId, blob, folderId) {
     const found = await detectPage(c);
     const page = await buildPage(docId, c, {
       corners: found?.corners || FULL_FRAME,
-      mids: found?.mids || null,
       ...lastLook(),
       rotation: 0,
       needsReview: !found,
@@ -749,7 +748,7 @@ async function renderPage(docId, index) {
       await pageAction(async () => {
         const prog = progress('กำลังหมุน…');
         try {
-          const c = await loadCanvas(page.original);
+          const c = await loadOriginal(page);
           await buildPage(docId, c, { ...pageLook(page), rotation: ((page.rotation || 0) + 90) % 360, erase: rotateStrokes(page.erase || [], 90) }, page);
           freeCanvas(c);
           await refreshDoc(doc);
@@ -778,7 +777,7 @@ async function renderPage(docId, index) {
 
 /** ค่าการจัดหน้าเดิมของหน้า (ใช้คำนวณใหม่จากภาพต้นฉบับ) */
 const pageLook = (page) => ({
-  corners: page.corners, mids: page.mids, filter: page.filter, contrast: page.contrast ?? 0.5,
+  corners: page.corners, filter: page.filter, contrast: page.contrast ?? 0.5,
   brightness: page.brightness ?? 0, sharpness: page.sharpness ?? 0,
   rotation: page.rotation || 0, straighten: page.straighten ?? false, needsReview: page.needsReview,
   erase: page.erase || [],
@@ -800,6 +799,27 @@ async function pageAction(fn) {
   }
 }
 
+/**
+ * เปิดภาพต้นฉบับของหน้า · ถ้าต้นฉบับเสีย (iPhone อ่านไม่ได้) ใช้ภาพที่ปรับแล้วเป็นต้นฉบับใหม่แทน
+ * แล้วรีเซ็ตขอบ/การหมุน/รอยลบ เพราะภาพนั้นตัดขอบและหมุนมาแล้ว
+ */
+async function loadOriginal(page) {
+  try {
+    return await loadCanvas(page.original);
+  } catch (err) {
+    console.warn('original unreadable', err);
+    const c = await loadCanvas(page.processed);
+    Object.assign(page, {
+      original: await toBlob(c, 0.92),
+      corners: FULL_FRAME.map((p) => [...p]), mids: null,
+      rotation: 0, erase: [], straighten: false, needsReview: false,
+    });
+    await db.put('pages', page);
+    toast('ภาพต้นฉบับหน้านี้เปิดไม่ได้ จึงใช้ภาพที่ปรับแล้วเป็นต้นฉบับแทน', { ms: 5000 });
+    return c;
+  }
+}
+
 /** เปลี่ยนฟิลเตอร์หลายหน้าพร้อมกัน (คำนวณใหม่จากภาพต้นฉบับ ขอบ/การหมุนเดิม) */
 async function refilterPages(doc, ids, filter) {
   const prog = progress('กำลังปรับฟิลเตอร์…');
@@ -808,7 +828,7 @@ async function refilterPages(doc, ids, filter) {
       prog.update(`กำลังปรับฟิลเตอร์ ${i + 1}/${ids.length}`);
       const page = await db.get('pages', ids[i]);
       if (!page) continue;
-      const c = await loadCanvas(page.original);
+      const c = await loadOriginal(page);
       await buildPage(doc.id, c, { ...pageLook(page), filter }, page);
       freeCanvas(c);
     }
@@ -826,7 +846,7 @@ async function erasePage(doc, page) {
   try {
     // ภาพฐานที่ยังไม่มีรอยลบ (รอยเดิมแก้/ย้อนกลับได้)
     if (page.erase?.length) {
-      const c = await loadCanvas(page.original);
+      const c = await loadOriginal(page);
       base = await processCanvas(c, { ...pageLook(page), erase: [] });
       freeCanvas(c);
     } else {
@@ -840,7 +860,7 @@ async function erasePage(doc, page) {
   if (!strokes) return;
   const prog = progress('กำลังบันทึก…');
   try {
-    const c = await loadCanvas(page.original);
+    const c = await loadOriginal(page);
     await buildPage(doc.id, c, { ...pageLook(page), erase: strokes }, page);
     freeCanvas(c);
     await refreshDoc(doc);
@@ -853,7 +873,7 @@ async function reEditPage(doc, page) {
   const loading = progress('กำลังเปิดภาพ…');
   let canvas;
   try {
-    canvas = await loadCanvas(page.original);
+    canvas = await loadOriginal(page);
   } finally {
     loading.close();
   }
@@ -862,7 +882,7 @@ async function reEditPage(doc, page) {
     if (!res) return;
     let erase = page.erase || [];
     if (erase.length) {
-      const same = JSON.stringify([res.corners, res.mids, res.straighten]) === JSON.stringify([page.corners, page.mids ?? null, page.straighten ?? false]);
+      const same = JSON.stringify([res.corners, res.straighten]) === JSON.stringify([page.corners, page.straighten ?? false]);
       if (same) erase = rotateStrokes(erase, (res.rotation || 0) - (page.rotation || 0));
       else { erase = []; toast('ล้างรอยลบข้อความแล้ว เพราะเปลี่ยนขอบภาพ', { ms: 4000 }); }
     }
@@ -1087,6 +1107,8 @@ async function init() {
   settings = { ...DEFAULT_SETTINGS, ...(await db.getMeta('settings', {})) };
   await route();
   purgeOldTrash().catch(() => {});
+  // ข้อมูลจากเวอร์ชันก่อน: แปลงรูปให้เป็นแบบที่ Safari อ่านได้เสถียร
+  db.migrateBlobs().then((broken) => { if (broken) console.warn(`${broken} images unreadable`); }).catch(console.warn);
   registerServiceWorker();
   // โหลด OpenCV ไว้ล่วงหน้าตอนว่าง เพื่อให้ถ่ายรูปแรกได้เร็ว
   setTimeout(() => warmup().catch(() => {}), 2500);

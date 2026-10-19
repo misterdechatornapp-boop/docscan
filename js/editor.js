@@ -1,4 +1,4 @@
-// หน้าปรับภาพ 2 ขั้น: (1) ลากมุม/จุดกลางขอบให้ตรงขอบกระดาษ (2) เลือกฟิลเตอร์ + หมุน
+// หน้าปรับภาพ 2 ขั้น: (1) ลากมุมให้ตรงขอบกระดาษ (2) เลือกฟิลเตอร์ + หมุน
 import { icon } from './icons.js';
 import { esc } from './ui.js';
 import { detectPage, processCanvas, scaleCanvas, freeCanvas, FULL_FRAME } from './imaging.js';
@@ -19,12 +19,14 @@ export const FILTERS = [
   { id: 'original', label: 'ต้นฉบับ' },
 ];
 
+// เปิด/ปิดแผงปรับแสงค้างไว้ระหว่างใช้งาน (ปิดไว้ก่อน ให้ภาพพรีวิวใหญ่)
+let adjustOpen = false;
+
 /**
  * เปิดหน้าปรับภาพ
  * @param {object} o
  * @param {HTMLCanvasElement} o.canvas ภาพต้นฉบับ
  * @param {number[][]} [o.corners] มุมเดิม (ถ้าไม่ส่ง จะหาขอบอัตโนมัติ)
- * @param {number[][]} [o.mids] จุดกลางขอบ [บน, ขวา, ล่าง, ซ้าย] (null = ขอบตรง)
  * @param {string} o.filter
  * @param {number} [o.rotation]
  * @param {number} [o.contrast] 0..1
@@ -32,9 +34,10 @@ export const FILTERS = [
  * @param {number} [o.sharpness] 0..1
  * @param {boolean} [o.straighten] ดัดเส้นตาราง/บรรทัดที่โค้งให้ตรง
  * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
- * @returns {Promise<{corners, mids, filter, rotation, contrast, cont}|null>} cont = กด "บันทึก + ถ่ายต่อ"
+ * @returns {Promise<{corners, filter, rotation, contrast, brightness, sharpness, straighten, cont}|null>}
  */
-export function openEditor({ canvas, corners, mids = null, filter, rotation = 0, contrast = 0.5, brightness = 0, sharpness = DEFAULT_LOOK.sharpness, straighten = true, onContinue }) {
+export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0.5, brightness = 0, sharpness = DEFAULT_LOOK.sharpness, straighten = false, onContinue }) {
+  const look = { contrast, brightness, sharpness };
   const dlg = document.createElement('dialog');
   dlg.className = 'editor';
   dlg.setAttribute('aria-label', 'ปรับภาพเอกสาร');
@@ -47,51 +50,52 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       </header>
       <div class="ed-stage">
         <div class="ed-frame">
-          <svg class="ed-poly" viewBox="0 0 1 1" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"/></svg>
+          <svg class="ed-poly" viewBox="0 0 1 1" preserveAspectRatio="none"><polygon vector-effect="non-scaling-stroke"/></svg>
           ${[0, 1, 2, 3].map((i) => `<div class="ed-h" data-i="${i}" role="slider" aria-label="มุมที่ ${i + 1}" tabindex="0"></div>`).join('')}
-          ${EDGE_NAMES.map((n, k) => `<div class="ed-h ed-m" data-m="${k}" role="slider" aria-label="จุดกลางขอบ${n} (ลากเพื่อดัดขอบโค้ง)" tabindex="0"></div>`).join('')}
         </div>
         <canvas class="ed-loupe" width="240" height="240"></canvas>
         <div class="ed-status"></div>
       </div>
-      <footer class="ed-tools">
-        <button type="button" class="tool" data-act="auto">${icon('wand')}<span>หาขอบอัตโนมัติ</span></button>
-        <button type="button" class="tool" data-act="full">${icon('expand')}<span>ใช้ทั้งภาพ</span></button>
+      <footer class="ed-bar">
+        <button type="button" class="chip chip-icon" data-act="auto">${icon('wand')}หาขอบอัตโนมัติ</button>
+        <button type="button" class="chip chip-icon" data-act="full">${icon('expand')}ใช้ทั้งภาพ</button>
       </footer>
     </section>
     <section class="ed-step" data-step="2" hidden>
       <header class="ed-top">
         <button type="button" class="btn btn-ghost" data-act="back">${icon('back')}ขอบ</button>
-        <div class="ed-title">ฟิลเตอร์</div>
+        <span class="ed-title"></span>
+        <button type="button" class="icon-btn" data-act="rotL" aria-label="หมุนซ้าย">${icon('rotL')}</button>
+        <button type="button" class="icon-btn" data-act="rotR" aria-label="หมุนขวา">${icon('rotR')}</button>
         <button type="button" class="btn btn-primary" data-act="save">บันทึก</button>
       </header>
       <div class="ed-stage ed-preview"><div class="spinner"></div></div>
-      <div class="ed-filters">
-        ${FILTERS.map((f) => `<button type="button" class="chip" data-filter="${f.id}">${esc(f.label)}</button>`).join('')}
-        <button type="button" class="chip chip-toggle" data-act="straighten" aria-pressed="${straighten}">${icon('lines')}ดัดเส้นให้ตรง</button>
+      <div class="ed-panel">
+        <div class="ed-chips">
+          ${FILTERS.map((f) => `<button type="button" class="chip" data-filter="${f.id}">${esc(f.label)}</button>`).join('')}
+        </div>
+        <div class="ed-chips">
+          <button type="button" class="chip chip-toggle" data-act="straighten" aria-pressed="${straighten}">${icon('lines')}ดัดเส้นให้ตรง</button>
+          <button type="button" class="chip chip-toggle" data-act="adjust" aria-pressed="${adjustOpen}">${icon('sliders')}ปรับแสง</button>
+          ${onContinue ? `<button type="button" class="chip chip-icon chip-accent" data-act="saveMore">${icon('camera')}บันทึก+ถ่ายต่อ</button>` : ''}
+        </div>
+        <div class="ed-adjust" ${adjustOpen ? '' : 'hidden'}>
+          ${ADJUST.map((a) => `
+            <div class="adj-row">
+              <label for="adj-${a.key}">${a.label}</label>
+              <input type="range" id="adj-${a.key}" data-adj="${a.key}" min="${a.min}" max="${a.max}" step="1" value="${Math.round(look[a.key] * a.scale)}">
+              <output>${Math.round(look[a.key] * a.scale)}</output>
+            </div>`).join('')}
+          <button type="button" class="btn btn-ghost adj-reset" data-act="adj-reset">${icon('restore')}ค่าเริ่มต้น</button>
+        </div>
       </div>
-      <div class="ed-contrast">
-        ${ADJUST.map((a) => `
-          <div class="adj-row">
-            <label for="adj-${a.key}">${a.label}</label>
-            <input type="range" id="adj-${a.key}" data-adj="${a.key}" min="${a.min}" max="${a.max}" step="1" value="${Math.round({ contrast, brightness, sharpness }[a.key] * a.scale)}">
-            <output>${Math.round({ contrast, brightness, sharpness }[a.key] * a.scale)}</output>
-          </div>`).join('')}
-        <button type="button" class="btn btn-ghost adj-reset" data-act="adj-reset">${icon('restore')}ค่าเริ่มต้น</button>
-      </div>
-      <footer class="ed-tools">
-        <button type="button" class="tool" data-act="rotL">${icon('rotL')}<span>หมุนซ้าย</span></button>
-        <button type="button" class="tool" data-act="rotR">${icon('rotR')}<span>หมุนขวา</span></button>
-        ${onContinue ? `<button type="button" class="tool tool-accent" data-act="saveMore">${icon('camera')}<span>บันทึก + ถ่ายต่อ</span></button>` : ''}
-      </footer>
     </section>`;
   document.body.appendChild(dlg);
 
   const frame = dlg.querySelector('.ed-frame');
   const stage = dlg.querySelector('.ed-stage');
-  const outline = dlg.querySelector('.ed-poly path');
-  const handles = [...dlg.querySelectorAll('.ed-h:not(.ed-m)')];
-  const midHandles = [...dlg.querySelectorAll('.ed-m')];
+  const poly = dlg.querySelector('.ed-poly polygon');
+  const handles = [...dlg.querySelectorAll('.ed-h')];
   const loupe = dlg.querySelector('.ed-loupe');
   const status = dlg.querySelector('.ed-status');
   const nextBtn = dlg.querySelector('[data-act="next"]');
@@ -99,16 +103,11 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
 
   const state = {
     corners: corners ? corners.map((p) => [...p]) : FULL_FRAME.map((p) => [...p]),
-    mids: null,
     filter,
     rotation,
-    contrast,
-    brightness,
-    sharpness,
+    ...look,
     straighten,
   };
-
-  state.mids = mids ? mids.map((p) => [...p]) : chordMids(state.corners);
 
   // ภาพสำหรับแสดงบนจอ (ย่อให้พอดีจอ เพื่อความลื่น)
   const display = scaleCanvas(canvas, Math.max(window.innerWidth, window.innerHeight) * Math.min(2, devicePixelRatio || 1));
@@ -129,11 +128,7 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       handles[i].style.left = `${x * 100}%`;
       handles[i].style.top = `${y * 100}%`;
     });
-    state.mids.forEach(([x, y], k) => {
-      midHandles[k].style.left = `${x * 100}%`;
-      midHandles[k].style.top = `${y * 100}%`;
-    });
-    outline.setAttribute('d', outlinePath(state.corners, state.mids));
+    poly.setAttribute('points', state.corners.map((p) => p.join(',')).join(' '));
     const ok = isConvex(state.corners);
     frame.classList.toggle('invalid', !ok);
     nextBtn.disabled = !ok;
@@ -153,11 +148,9 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       const found = await detectPage(canvas);
       if (found) {
         state.corners = found.corners;
-        state.mids = found.mids || chordMids(found.corners);
-        setStatus(found.mids ? 'พบขอบกระดาษโค้ง · ดัดให้ตรงอัตโนมัติ' : '');
+        setStatus('');
       } else {
         state.corners = FULL_FRAME.map((p) => [...p]);
-        state.mids = chordMids(state.corners);
         setStatus('ไม่พบขอบกระดาษ — ลากมุมทั้ง 4 เอง');
       }
     } catch (err) {
@@ -166,38 +159,25 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     }
   }
 
-  /* ----- ลากมุม / จุดกลางขอบ ----- */
-  // ย้ายมุม: จุดกลางของสองขอบที่ติดมุมนั้นเลื่อนตามครึ่งหนึ่ง (รักษารูปโค้งเดิม)
-  const setCorner = (i, p) => {
-    const d = [p[0] - state.corners[i][0], p[1] - state.corners[i][1]];
-    state.corners[i] = p;
-    EDGES.forEach(([a, b], k) => {
-      if (a === i || b === i) state.mids[k] = [clamp(state.mids[k][0] + d[0] / 2), clamp(state.mids[k][1] + d[1] / 2)];
-    });
-  };
-  const points = [
-    ...handles.map((h, i) => ({ h, get: () => state.corners[i], set: (p) => setCorner(i, p) })),
-    ...midHandles.map((h, k) => ({ h, get: () => state.mids[k], set: (p) => { state.mids[k] = p; } })),
-  ];
-  points.forEach(({ h, get, set }) => {
+  /* ----- ลากมุม ----- */
+  handles.forEach((h, i) => {
     let off = [0, 0];
     h.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       e.preventDefault();
       const r = frame.getBoundingClientRect();
-      off = [e.clientX - (r.left + get()[0] * r.width), e.clientY - (r.top + get()[1] * r.height)];
+      off = [e.clientX - (r.left + state.corners[i][0] * r.width), e.clientY - (r.top + state.corners[i][1] * r.height)];
       h.setPointerCapture(e.pointerId);
       h.classList.add('dragging');
       status.dataset.msg = '';
+      drawLoupe(i);
     });
     h.addEventListener('pointermove', (e) => {
       if (!h.hasPointerCapture(e.pointerId)) return;
       const r = frame.getBoundingClientRect();
-      const x = clamp((e.clientX - off[0] - r.left) / r.width);
-      const y = clamp((e.clientY - off[1] - r.top) / r.height);
-      set([x, y]);
+      state.corners[i] = [clamp((e.clientX - off[0] - r.left) / r.width), clamp((e.clientY - off[1] - r.top) / r.height)];
       render();
-      drawLoupe(x, y, e.clientX < window.innerWidth / 2);
+      drawLoupe(i);
     });
     h.addEventListener('lostpointercapture', () => {
       h.classList.remove('dragging');
@@ -208,29 +188,54 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
       const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
       if (!d) return;
       e.preventDefault();
-      set([clamp(get()[0] + d[0]), clamp(get()[1] + d[1])]);
+      state.corners[i] = [clamp(state.corners[i][0] + d[0]), clamp(state.corners[i][1] + d[1])];
       render();
     });
   });
 
-  function drawLoupe(x, y, fingerOnLeft) {
+  /**
+   * แว่นขยาย: ภาพรอบมุมที่กำลังลาก + เส้นขอบสองเส้นที่ต่อจากมุมนั้น จุดกลางแว่น = ตำแหน่งมุมพอดี
+   * แสดงที่มุมจอฝั่งตรงข้ามกับมุมที่ลาก เพื่อไม่บังนิ้วและจุดที่ลาก
+   */
+  function drawLoupe(i) {
     const ctx = loupe.getContext('2d');
-    const zoom = 2.5;
+    const L = loupe.width;
+    const zoom = 3; // เท่าของภาพบนจอ
     const r = frame.getBoundingClientRect();
-    const scale = display.width / r.width; // พิกเซลภาพต่อพิกเซลจอ
-    const srcSize = (loupe.width / 2 / zoom) * scale;
-    const sx = x * display.width - srcSize / 2;
-    const sy = y * display.height - srcSize / 2;
+    const k = display.width / r.width;          // พิกเซลภาพ ต่อ พิกเซลจอ
+    const LOUPE_CSS = 120;                       // ขนาดแว่นบนจอ (ตรงกับ .ed-loupe ใน app.css)
+    const half = (LOUPE_CSS / zoom) * k / 2;     // ครึ่งความกว้างของพื้นที่ภาพที่แสดงในแว่น (พิกเซลภาพ)
+    const cx = state.corners[i][0] * display.width;
+    const cy = state.corners[i][1] * display.height;
+    const s = L / (2 * half);                    // พิกเซลแว่น ต่อ พิกเซลภาพ
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, loupe.width, loupe.height);
-    ctx.drawImage(display, sx, sy, srcSize, srcSize, 0, 0, loupe.width, loupe.height);
+    ctx.fillRect(0, 0, L, L);
+    // วาดด้วยการแปลงพิกัด (ไม่ใช้ source rect ที่เลยขอบภาพ ซึ่ง Safari วาดต่างจากเบราว์เซอร์อื่น)
+    ctx.setTransform(s, 0, 0, s, L / 2 - cx * s, L / 2 - cy * s);
+    ctx.drawImage(display, 0, 0);
+    // เส้นขอบกรอบ (พิกัดภาพ)
+    const P = state.corners.map(([x, y]) => [x * display.width, y * display.height]);
+    ctx.lineWidth = 2 / s;
     ctx.strokeStyle = '#2dd4bf';
-    ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(loupe.width / 2, loupe.height / 2 - 26); ctx.lineTo(loupe.width / 2, loupe.height / 2 + 26);
-    ctx.moveTo(loupe.width / 2 - 26, loupe.height / 2); ctx.lineTo(loupe.width / 2 + 26, loupe.height / 2);
+    P.forEach((p, j) => (j ? ctx.lineTo(...p) : ctx.moveTo(...p)));
+    ctx.closePath();
     ctx.stroke();
-    loupe.classList.toggle('right', fingerOnLeft);
+    // เป้าเล็งตรงกลาง
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(L / 2, L / 2, 9, 0, Math.PI * 2);
+    ctx.moveTo(L / 2 - 22, L / 2); ctx.lineTo(L / 2 - 12, L / 2);
+    ctx.moveTo(L / 2 + 12, L / 2); ctx.lineTo(L / 2 + 22, L / 2);
+    ctx.moveTo(L / 2, L / 2 - 22); ctx.lineTo(L / 2, L / 2 - 12);
+    ctx.moveTo(L / 2, L / 2 + 12); ctx.lineTo(L / 2, L / 2 + 22);
+    ctx.stroke();
+    // มุมซ้าย (0, 3) → แว่นไปขวา · มุมบน (0, 1) → แว่นไปล่าง
+    loupe.classList.toggle('right', i === 0 || i === 3);
+    loupe.classList.toggle('bottom', i === 0 || i === 1);
     loupe.classList.add('show');
   }
 
@@ -242,7 +247,7 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     dlg.querySelectorAll('[data-filter]').forEach((b) => b.classList.toggle('active', b.dataset.filter === state.filter));
     try {
       if (!previewSrc) previewSrc = scaleCanvas(canvas, 1400);
-      const out = await processCanvas(previewSrc, result());
+      const out = await processCanvas(previewSrc, state);
       if (token !== previewToken) { freeCanvas(out); return; }
       out.className = 'ed-preview-img';
       const old = previewBox.querySelector('canvas');
@@ -254,14 +259,7 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     }
   }
 
-  /** ค่าที่ส่งออก: mids = null เมื่อขอบทุกด้านตรง */
-  function result() {
-    const straight = state.mids.every((m, k) => {
-      const c = chordMids(state.corners)[k];
-      return Math.hypot(m[0] - c[0], m[1] - c[1]) < 0.003;
-    });
-    return { ...state, mids: straight ? null : state.mids.map((p) => [...p]) };
-  }
+  const result = () => ({ ...state, corners: state.corners.map((p) => [...p]), mids: null });
 
   function showStep(n) {
     dlg.querySelectorAll('.ed-step').forEach((s) => { s.hidden = s.dataset.step !== String(n); });
@@ -286,20 +284,24 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
     dlg.addEventListener('click', (e) => {
       const fb = e.target.closest('[data-filter]');
       if (fb) { state.filter = fb.dataset.filter; renderPreview(); return; }
-      const act = e.target.closest('[data-act]')?.dataset.act;
+      const btn = e.target.closest('[data-act]');
+      const act = btn?.dataset.act;
       if (act === 'cancel') finish(null);
       else if (act === 'next') showStep(2);
       else if (act === 'back') showStep(1);
       else if (act === 'auto') autoDetect();
-      else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); state.mids = chordMids(state.corners); setStatus(''); }
-      else if (act === 'adj-reset') {
+      else if (act === 'full') { state.corners = FULL_FRAME.map((p) => [...p]); setStatus(''); }
+      else if (act === 'adjust') {
+        adjustOpen = !adjustOpen;
+        btn.setAttribute('aria-pressed', String(adjustOpen));
+        dlg.querySelector('.ed-adjust').hidden = !adjustOpen;
+      } else if (act === 'adj-reset') {
         Object.assign(state, DEFAULT_LOOK);
         syncAdjust();
         renderPreview();
-      }
-      else if (act === 'straighten') {
+      } else if (act === 'straighten') {
         state.straighten = !state.straighten;
-        e.target.closest('[data-act]').setAttribute('aria-pressed', String(state.straighten));
+        btn.setAttribute('aria-pressed', String(state.straighten));
         renderPreview();
       }
       else if (act === 'rotL') { state.rotation = (state.rotation + 270) % 360; renderPreview(); }
@@ -337,21 +339,6 @@ export function openEditor({ canvas, corners, mids = null, filter, rotation = 0,
 }
 
 const clamp = (v) => Math.min(1, Math.max(0, v));
-
-const EDGES = [[0, 1], [1, 2], [3, 2], [0, 3]]; // บน ขวา ล่าง ซ้าย (ตรงกับ cv-worker.js)
-const EDGE_NAMES = ['บน', 'ขวา', 'ล่าง', 'ซ้าย'];
-
-const chordMids = (c) => EDGES.map(([a, b]) => [(c[a][0] + c[b][0]) / 2, (c[a][1] + c[b][1]) / 2]);
-
-/** เส้นกรอบที่ผ่านมุมและจุดกลางขอบ (Bezier กำลังสอง: จุดควบคุม = 2M − (A + B) / 2) */
-function outlinePath(c, m) {
-  const ctrl = (k) => {
-    const [a, b] = EDGES[k];
-    return [2 * m[k][0] - (c[a][0] + c[b][0]) / 2, 2 * m[k][1] - (c[a][1] + c[b][1]) / 2];
-  };
-  const P = (p) => `${p[0]} ${p[1]}`;
-  return `M${P(c[0])} Q${P(ctrl(0))} ${P(c[1])} Q${P(ctrl(1))} ${P(c[2])} Q${P(ctrl(2))} ${P(c[3])} Q${P(ctrl(3))} ${P(c[0])}Z`;
-}
 
 function isConvex(pts) {
   let sign = 0;

@@ -1,7 +1,7 @@
 // กล้องในแอป: เปิดไฟฉายได้ · ถ่ายต่อเนื่องหรือทีละหน้า · มีเสียงชัตเตอร์
 import { icon } from './icons.js';
 import { toast } from './ui.js';
-import { detectCorners, scaleCanvas, freeCanvas, toBlob } from './imaging.js';
+import { detectCorners, scaleCanvas, freeCanvas, toBlob, MAX_SIDE } from './imaging.js';
 import { shutterSound } from './sound.js';
 
 export const cameraSupported = () => !!navigator.mediaDevices?.getUserMedia;
@@ -101,12 +101,13 @@ export async function openCameraView({ mode = 'batch', onModeChange, onShot, onB
     setTimeout(detectLoop, 800);
   }
 
-  function grabFrame(maxSide = Infinity) {
+  // ภาพที่ถ่าย: ย่อด้านยาวไม่เกิน MAX_SIDE (ภาพ 4K เต็มขนาดกินหน่วยความจำ iPhone จนเปิดภาพไม่ได้)
+  function grabFrame(maxSide = MAX_SIDE) {
     const c = document.createElement('canvas');
     c.width = video.videoWidth;
     c.height = video.videoHeight;
     c.getContext('2d').drawImage(video, 0, 0);
-    if (maxSide === Infinity) return c;
+    if (Math.max(c.width, c.height) <= maxSide) return c;
     const small = scaleCanvas(c, maxSide);
     freeCanvas(c);
     return small;

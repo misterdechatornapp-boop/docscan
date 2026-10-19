@@ -3,6 +3,23 @@ export const MAX_SIDE = 2800;   // ด้านยาวสุดของภา
 export const THUMB_SIDE = 360;
 
 export async function loadCanvas(blob, maxSide = MAX_SIDE) {
+  try {
+    return await loadViaImage(blob, maxSide);
+  } catch {
+    // สำรอง: ถอดรหัสภาพอีกวิธี (ช่วยเมื่อ <img> เปิดไม่ได้เพราะหน่วยความจำ/ไฟล์ใหญ่)
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+      const c = drawScaled(bmp, bmp.width, bmp.height, maxSide);
+      bmp.close?.();
+      return c;
+    } catch {
+      throw new Error('เปิดภาพไม่ได้');
+    }
+  }
+}
+
+async function loadViaImage(blob, maxSide) {
   const url = URL.createObjectURL(blob);
   try {
     // ใช้ onload แทน img.decode() เพราะ decode() อาจค้างเมื่อหน้าจอไม่ได้วาด
@@ -110,7 +127,7 @@ function imagePayload(canvas) {
 /** โหลด OpenCV ล่วงหน้า (ไฟล์ใหญ่ ~10 MB) */
 export const warmup = () => call('init');
 
-/** หาขอบกระดาษ คืน { corners, mids } แบบสัดส่วน 0..1 หรือ null · mids = จุดกลางขอบที่โค้ง (null = ขอบตรง) */
+/** หาขอบกระดาษ คืน { corners } แบบสัดส่วน 0..1 หรือ null */
 export async function detectPage(canvas) {
   const small = scaleCanvas(canvas, 640);
   try {
@@ -124,10 +141,10 @@ export async function detectPage(canvas) {
 export const detectCorners = async (canvas) => (await detectPage(canvas))?.corners ?? null;
 
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, mids = null, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
-  const plain = isFullFrame(corners) && !mids;
+export async function processCanvas(canvas, { corners, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
+  const plain = isFullFrame(corners);
   const r = await callWithRetry('process', () => ({
-    image: imagePayload(canvas), corners: plain ? null : corners || FULL_FRAME, mids, filter, rotation, contrast, brightness, sharpness, straighten,
+    image: imagePayload(canvas), corners: plain ? null : corners, filter, rotation, contrast, brightness, sharpness, straighten,
   }));
   const out = document.createElement('canvas');
   out.width = r.w;
