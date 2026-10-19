@@ -111,11 +111,11 @@ function call(type, payload = {}, transfer = []) {
 async function callWithRetry(type, makePayload) {
   try {
     const p = makePayload();
-    return await call(type, p, [p.image.data]);
+    return await call(type, p, p.image ? [p.image.data] : []);
   } catch (err) {
     if (!err.crashed) throw err;
     const p = makePayload();
-    return call(type, p, [p.image.data]);
+    return call(type, p, p.image ? [p.image.data] : []);
   }
 }
 
@@ -141,11 +141,44 @@ export async function detectPage(canvas) {
 export const detectCorners = async (canvas) => (await detectPage(canvas))?.corners ?? null;
 
 /** ดัดภาพ + ฟิลเตอร์ + หมุน คืนเป็น canvas ใหม่ */
-export async function processCanvas(canvas, { corners, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
-  const plain = isFullFrame(corners);
-  const r = await callWithRetry('process', () => ({
-    image: imagePayload(canvas), corners: plain ? null : corners, filter, rotation, contrast, brightness, sharpness, straighten,
-  }));
+export async function processCanvas(canvas, opts) {
+  return toCanvas(await callWithRetry('process', () => ({ image: imagePayload(canvas), ...processOpts(opts) })));
+}
+
+const processOpts = ({ corners, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false, fillEdges = false }) => ({
+  corners: isFullFrame(corners) ? null : corners, filter, rotation, contrast, brightness, sharpness, straighten, fillEdges,
+});
+
+/**
+ * ภาพต้นทางที่ใช้ซ้ำ (หน้าปรับภาพ): ส่งภาพให้ตัวประมวลผลครั้งเดียว แล้วเปลี่ยนฟิลเตอร์/แถบปรับได้เร็ว
+ * คืน { process(opts) → canvas, drop() }
+ */
+export function imageSource(canvas) {
+  const id = `src${++seq}`;
+  let ready = null;
+  const send = () => {
+    const image = imagePayload(canvas);
+    ready = call('setSource', { sourceId: id, image }, [image.data]);
+    return ready;
+  };
+  return {
+    async process(opts) {
+      if (!ready) send();
+      try {
+        await ready;
+        return toCanvas(await call('process', { sourceId: id, ...processOpts(opts) }));
+      } catch (err) {
+        // ตัวประมวลผลเริ่มใหม่ (ภาพที่ส่งไว้หาย): ส่งใหม่แล้วลองอีกครั้ง
+        if (!err.crashed && !/NOSOURCE/.test(err.message)) throw err;
+        await send();
+        return toCanvas(await call('process', { sourceId: id, ...processOpts(opts) }));
+      }
+    },
+    drop() { if (ready) call('dropSource', { sourceId: id }).catch(() => {}); },
+  };
+}
+
+function toCanvas(r) {
   const out = document.createElement('canvas');
   out.width = r.w;
   out.height = r.h;

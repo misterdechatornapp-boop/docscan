@@ -133,7 +133,10 @@ export async function withBusy(btn, fn) {
   try { return await fn(); } finally { btn.disabled = false; btn.classList.remove('busy'); }
 }
 
-/** ตัวบอกความคืบหน้าแบบเต็มจอ (ใช้ตอนประมวลผลหลายภาพ) */
+/**
+ * ตัวบอกความคืบหน้าแบบเต็มจอ · แสดงเฉพาะเมื่อรอนานเกิน 300 ms (งานเร็วจะไม่เห็นหน้าจอกะพริบ)
+ */
+let progressOwners = 0;
 export function progress(text) {
   let el = $('#progress');
   if (!el) {
@@ -143,10 +146,17 @@ export function progress(text) {
     document.body.appendChild(el);
   }
   el.querySelector('.progress-text').textContent = text;
-  el.classList.add('show');
+  progressOwners++;
+  let closed = false;
+  const timer = setTimeout(() => { if (!closed) el.classList.add('show'); }, 300);
   return {
     update(t) { el.querySelector('.progress-text').textContent = t; },
-    close() { el.classList.remove('show'); },
+    close() {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timer);
+      if (--progressOwners <= 0) { progressOwners = 0; el.classList.remove('show'); }
+    },
   };
 }
 

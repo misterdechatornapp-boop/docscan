@@ -481,9 +481,9 @@ dialog.editor::backdrop { background: #000; }
 .ed-status:empty { display: none; }
 .ed-preview { padding: 16px; }
 .ed-preview canvas { max-width: 100%; max-height: 100%; box-shadow: 0 2px 16px rgb(0 0 0 / .6); }
-.ed-preview > .spinner { position: absolute; display: none; }
+.ed-preview > .spinner { position: absolute; top: 14px; right: 14px; width: 22px; height: 22px; border-width: 2.5px; display: none; z-index: 1; }
 .ed-preview.loading > .spinner { display: block; }
-.ed-preview.loading canvas { opacity: .5; }
+.ed-preview canvas { transition: rotate .25s ease; }
 .ed-filters {
   display: flex;
   gap: 8px;
@@ -747,3 +747,80 @@ dialog.camera::backdrop { background: #000; }
 .ed-adjust { display: flex; flex-direction: column; }
 .ed-adjust .adj-row input { min-height: 28px; }
 .ed-adjust .adj-reset { min-height: 28px; }
+
+/* ===================== ความลื่น ===================== */
+
+/* ----- เปลี่ยนหน้า: หัว/แถบล่างคงที่ เนื้อหาเลื่อนตามทิศ ----- */
+.topbar { view-transition-name: topbar; }
+.bottombar, .toolbar { view-transition-name: bottombar; }
+::view-transition-group(root) { animation-duration: .28s; animation-timing-function: cubic-bezier(.2, .8, .2, 1); }
+::view-transition-group(topbar), ::view-transition-group(bottombar) { animation-duration: .2s; }
+@keyframes vt-out-left { to { transform: translateX(-30%); opacity: 0; } }
+@keyframes vt-in-right { from { transform: translateX(100%); } }
+@keyframes vt-out-right { to { transform: translateX(100%); } }
+@keyframes vt-in-left { from { transform: translateX(-30%); opacity: 0; } }
+@keyframes vt-fade-out { to { opacity: 0; } }
+@keyframes vt-fade-in { from { opacity: 0; } }
+html[data-vt="forward"]::view-transition-old(root) { animation-name: vt-out-left; }
+html[data-vt="forward"]::view-transition-new(root) { animation-name: vt-in-right; }
+html[data-vt="backward"]::view-transition-old(root) { animation-name: vt-out-right; z-index: 1; }
+html[data-vt="backward"]::view-transition-new(root) { animation-name: vt-in-left; }
+html[data-vt="fade"]::view-transition-old(root) { animation-name: vt-fade-out; }
+html[data-vt="fade"]::view-transition-new(root) { animation-name: vt-fade-in; }
+/* ปัดเปลี่ยนหน้า: ภาพเดิมเลื่อนออกไปแล้วด้วยนิ้ว เหลือแค่ภาพใหม่เลื่อนเข้า */
+html[data-vt="next-in"]::view-transition-old(root),
+html[data-vt="prev-in"]::view-transition-old(root) { animation: none; opacity: 0; }
+@keyframes vt-in-right-short { from { transform: translateX(40%); opacity: 0; } }
+@keyframes vt-in-left-short { from { transform: translateX(-40%); opacity: 0; } }
+html[data-vt="next-in"]::view-transition-new(root) { animation-name: vt-in-right-short; }
+html[data-vt="prev-in"]::view-transition-new(root) { animation-name: vt-in-left-short; }
+
+/* ----- ป๊อปอัป/เมนูเปิดแบบนุ่ม ----- */
+dialog.box[open] {
+  transition: opacity .18s ease-out, scale .18s ease-out;
+  @starting-style { opacity: 0; scale: .94; }
+}
+dialog.sheet[open] {
+  transition: translate .24s cubic-bezier(.2, .8, .2, 1);
+  @starting-style { translate: 0 100%; }
+}
+dialog.editor[open], dialog.camera[open] {
+  transition: opacity .18s ease-out;
+  @starting-style { opacity: 0; }
+}
+dialog[open]::backdrop {
+  transition: background-color .2s ease-out;
+  @starting-style { background-color: transparent; }
+}
+#toast { transition: opacity .2s, translate .25s cubic-bezier(.2, .8, .2, 1); }
+
+/* ----- ช่องรอหน้าที่กำลังจัดขอบ ----- */
+.page-card.skeleton {
+  display: grid;
+  place-items: center;
+  background: linear-gradient(110deg, #e8eaee 30%, #f6f7f9 50%, #e8eaee 70%) 0 0 / 300% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+.page-card.skeleton .spinner { width: 26px; height: 26px; border-width: 3px; border-color: #94a3b8; border-right-color: transparent; }
+@keyframes shimmer { to { background-position: -150% 0; } }
+
+/* ----- หน้าเดี่ยว: ภาพเลื่อนตามนิ้ว/หมุนทันที ----- */
+.viewer { touch-action: pan-y pinch-zoom; overflow: hidden; }
+.viewer .pg-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  transition: translate .2s cubic-bezier(.2, .8, .2, 1), rotate .26s cubic-bezier(.2, .8, .2, 1), scale .26s cubic-bezier(.2, .8, .2, 1);
+}
+.viewer .pg-img.dragging, .viewer .pg-img.no-anim { transition: none; }
+.viewer canvas.pg-preview { box-shadow: none; }
+.tool:active, .bar-btn:active, .chip:active, .icon-btn:active { transform: scale(.94); transition: transform .08s; }
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+  dialog[open], dialog[open]::backdrop, .viewer .pg-img { transition: none !important; }
+  .page-card.skeleton { animation: none; }
+}

@@ -15,6 +15,8 @@ self.onmessage = async (e) => {
     let result = true;
     let transfer = [];
     if (type === 'detect') result = detect(e.data.image);
+    else if (type === 'setSource') setSource(e.data.sourceId, e.data.image);
+    else if (type === 'dropSource') dropSource(e.data.sourceId);
     else if (type === 'process') {
       result = process(e.data);
       transfer = [result.data];
@@ -25,6 +27,25 @@ self.onmessage = async (e) => {
     self.postMessage({ id, ok: false, error: msg });
   }
 };
+
+/*
+ * ภาพต้นทางที่ส่งมาครั้งเดียวแล้วใช้ซ้ำ (หน้าปรับภาพ): ไม่ต้องส่งภาพใหม่ทุกครั้งที่เปลี่ยนฟิลเตอร์
+ * และจำผลขั้นที่หนัก (ดัดภาพ/ดัดเส้น/เติมขอบ) ไว้ เปลี่ยนแค่ฟิลเตอร์หรือแถบปรับแสงจึงเร็วมาก
+ */
+const sources = new Map();
+let geomCache = null; // { key, mat }
+
+function setSource(id, image) {
+  dropSource(id);
+  for (const [k, m] of sources) { if (sources.size < 2) break; m.delete(); sources.delete(k); }
+  sources.set(id, toMat(image));
+}
+
+function dropSource(id) {
+  sources.get(id)?.delete();
+  sources.delete(id);
+  if (geomCache?.key.startsWith(id + '|')) { geomCache.mat.delete(); geomCache = null; }
+}
 
 function toMat(image) {
   const m = new cv.Mat(image.h, image.w, cv.CV_8UC4);
@@ -110,10 +131,28 @@ function orderCorners(pts) {
 
 /* ---------- ดัดภาพ + ฟิลเตอร์ ---------- */
 
-function process({ image, corners, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false }) {
-  let mat = toMat(image);
+function process({ image, sourceId, corners, filter, rotation, contrast = 0.5, brightness = 0, sharpness = 0, straighten = false, fillEdges = false }) {
+  let mat;
+  const key = sourceId && `${sourceId}|${JSON.stringify([corners, straighten, fillEdges])}`;
+  if (sourceId && geomCache?.key === key) {
+    mat = geomCache.mat.clone();
+  } else {
+    if (sourceId && !sources.has(sourceId)) throw new Error('NOSOURCE');
+    mat = sourceId ? sources.get(sourceId).clone() : toMat(image);
+    mat = geometry(mat, { corners, straighten, fillEdges });
+    if (sourceId) {
+      geomCache?.mat.delete();
+      geomCache = { key, mat: mat.clone() };
+    }
+  }
+  return finish(mat, { filter, rotation, contrast, brightness, sharpness });
+}
+
+/** ขั้นหนัก: ดัดภาพตามมุม → ดัดเส้นให้ตรง → เติมขอบ */
+function geometry(mat, { corners, straighten, fillEdges }) {
+  const iw = mat.cols, ih = mat.rows;
   if (corners) {
-    const p = corners.map(([x, y]) => [x * image.w, y * image.h]);
+    const p = corners.map(([x, y]) => [x * iw, y * ih]);
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     const w = Math.max(1, Math.round(Math.max(dist(p[0], p[1]), dist(p[3], p[2]))));
     const h = Math.max(1, Math.round(Math.max(dist(p[0], p[3]), dist(p[1], p[2]))));
@@ -134,6 +173,12 @@ function process({ image, corners, filter, rotation, contrast = 0.5, brightness 
     if (flat) { mat.delete(); mat = flat; }
   }
 
+  if (fillEdges && corners) fillEdgeBackground(mat);
+  return mat;
+}
+
+/** ขั้นเบา: ฟิลเตอร์ + ปรับแสง + หมุน แล้วแปลงเป็นข้อมูลส่งกลับ */
+function finish(mat, { filter, rotation, contrast, brightness, sharpness }) {
   mat = applyFilter(mat, { filter, contrast, brightness, sharpness });
 
   if (rotation) {
@@ -158,9 +203,10 @@ function process({ image, corners, filter, rotation, contrast = 0.5, brightness 
 /* ---------- ดัดเส้นให้ตรง (กระดาษป่อง/โค้งกลางแผ่น) ---------- */
 
 /**
- * ใช้ "เส้นที่ควรตรง" ในเอกสารเป็นตัวอ้างอิง: เส้นตารางแนวนอน + แนวบรรทัดตัวหนังสือ (ควรเป็นแนวนอน)
- * และเส้นตารางแนวตั้ง (ควรเป็นแนวตั้ง) → หาว่าแต่ละจุดเลื่อนไปเท่าไร แล้วดึงภาพกลับให้เส้นตรง
- * คืน Mat ใหม่ หรือ null ถ้าหาเส้นไม่พอ / เส้นตรงอยู่แล้ว / ผลไม่น่าเชื่อถือ
+ * ดัดเส้นให้ตรงแบบแยกช่วง: แบ่งหน้ากระดาษเป็นช่วง ๆ ตามแถบว่างของกระดาษ (ช่องว่างระหว่างตาราง/ย่อหน้า)
+ * แล้วหาความโค้งและตรวจผลของแต่ละช่วงแยกกัน — ช่วงไหนดัดแล้วไม่ตรงขึ้นจะไม่แตะช่วงนั้น
+ * ในแถบว่างระหว่างช่วง ค่อย ๆ เปลี่ยนการเลื่อนจากช่วงบนไปช่วงล่าง (เป็นกระดาษเปล่า จึงไม่เห็นรอยต่อ)
+ * คืน Mat ใหม่ หรือ null ถ้าไม่มีช่วงไหนต้องดัด
  */
 function straightenLines(src) {
   const W = src.cols, H = src.rows;
@@ -175,57 +221,85 @@ function straightenLines(src) {
   cv.adaptiveThreshold(gray, ink, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
   gray.delete();
 
-  // เส้นแนวนอน: เส้นตาราง + บรรทัดตัวหนังสือ (เชื่อมตัวอักษรเป็นแถบยาวก่อน)
+  const regions = splitByGaps(ink, aw, ah);
+  // เส้นแนวนอนทั้งหน้า (เส้นตาราง + บรรทัดตัวหนังสือ) แล้วแบ่งให้ช่วงที่เส้นนั้นอยู่
   const rows = lineCurves(ink, aw, ah, true);
-  // เส้นแนวตั้ง: เฉพาะเส้นตาราง (หมุนภาพ 90° แล้วใช้วิธีเดียวกัน)
-  const inkT = new cv.Mat();
-  cv.transpose(ink, inkT);
+
+  for (const r of regions) {
+    const rh = r.y1 - r.y0;
+    const mine = rows.filter((pts) => {
+      const c = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+      return c >= r.y0 && c < r.y1;
+    });
+    // เส้นแนวตั้ง (เส้นตาราง) หาเฉพาะในช่วงนี้ — ตารางเล็กมีเส้นตั้งสั้น หาทั้งหน้าจะไม่เจอ
+    const roi = ink.roi(new cv.Rect(0, r.y0, aw, rh));
+    const inkT = new cv.Mat();
+    cv.transpose(roi, inkT);
+    roi.delete();
+    const cols = lineCurves(inkT, rh, aw, false).map((pts) => pts.map(([y, x]) => [x, y]));
+    inkT.delete();
+
+    // ตัวอย่างการเลื่อน (พิกัดภายในช่วง): ณ ตำแหน่งเส้นตรง ต้องดึงพิกเซลจากตำแหน่งเดิมที่ห่างเท่าไร
+    const dy = [];
+    for (const pts of mine) {
+      const c = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+      for (const [x, y] of pts) dy.push([x, c - r.y0, y - c, pts.length]);
+    }
+    const dx = [];
+    for (const pts of cols) {
+      const c = pts.reduce((a, p) => a + p[0], 0) / pts.length;
+      for (const [x, y] of pts) dx.push([c, y, x - c, pts.length]);
+    }
+    const span = (curves, axis, size) => {
+      if (curves.length < 2) return 0;
+      const v = curves.map((pts) => pts.reduce((a, p) => a + p[axis], 0) / pts.length);
+      return (Math.max(...v) - Math.min(...v)) / size;
+    };
+    const NY = rh > 0.35 * ah ? 3 : 2; // ช่วงเตี้ย: ความโค้งแนวตั้งน้อย ใช้ดีกรีต่ำ (กันเส้นเป็นคลื่น)
+    r.fy = mine.length >= 3 && span(mine, 1, rh) > 0.3 ? fitField(dy, aw, rh, 4, NY) : null;
+    r.fx = cols.length >= 2 && span(cols, 0, aw) > 0.4 ? fitField(dx, aw, rh, 4, NY) : null;
+
+    // เลื่อนน้อยมาก = ช่วงนี้ตรงอยู่แล้ว · เลื่อนมากเกิน = น่าจะจับผิด → ไม่ดัดช่วงนี้
+    let maxD = 0;
+    for (let gy = 0; gy <= 8; gy++) for (let gx = 0; gx <= 8; gx++) {
+      const x = (gx / 8) * aw, y = (gy / 8) * rh;
+      maxD = Math.max(maxD, Math.abs(r.fy ? r.fy(x, y) : 0), Math.abs(r.fx ? r.fx(x, y) : 0));
+    }
+    if (maxD < 1.2 || maxD > 0.07 * Math.max(aw, ah)) { r.fy = null; r.fx = null; }
+  }
   ink.delete();
-  const cols = lineCurves(inkT, ah, aw, false).map((pts) => pts.map(([y, x]) => [x, y]));
-  inkT.delete();
+  const active = regions.filter((r) => r.fy || r.fx);
+  if (!active.length) return null;
 
-  // ตัวอย่างการเลื่อน: ณ ตำแหน่งปลายทาง (เส้นตรง) ต้องไปดึงพิกเซลจากตำแหน่งเดิมที่ห่างเท่าไร
-  const dySamples = [];
-  for (const pts of rows) {
-    const c = pts.reduce((a, p) => a + p[1], 0) / pts.length;
-    const wgt = pts.length;
-    for (const [x, y] of pts) dySamples.push([x, c, y - c, wgt]);
-  }
-  const dxSamples = [];
-  for (const pts of cols) {
-    const c = pts.reduce((a, p) => a + p[0], 0) / pts.length;
-    const wgt = pts.length;
-    for (const [x, y] of pts) dxSamples.push([c, y, x - c, wgt]);
-  }
-  const spanOf = (curves, axis, size) => {
-    if (!curves.length) return 0;
-    const v = curves.map((pts) => pts.reduce((a, p) => a + p[axis], 0) / pts.length);
-    return (Math.max(...v) - Math.min(...v)) / size;
+  /** การเลื่อนของช่วง r ที่ x และแถว y (พิกัดภาพวิเคราะห์) · ช่วงที่ไม่ดัด = 0 */
+  const rowFns = (r, y) => {
+    const ly = Math.min(r.y1 - r.y0, Math.max(0, y - r.y0));
+    return { ex: r.fx?.rowEval(ly), ey: r.fy?.rowEval(ly) };
   };
-  // เส้นแนวนอนอย่างน้อย 4 เส้น กระจายเกิน 40% ของความสูง · เส้นแนวตั้งอย่างน้อย 2 เส้น ห่างกันเกิน 40% ของความกว้าง
-  const fy = rows.length >= 4 && spanOf(rows, 1, ah) > 0.4 ? fitField(dySamples, aw, ah) : null;
-  const fx = cols.length >= 2 && spanOf(cols, 0, aw) > 0.4 ? fitField(dxSamples, aw, ah) : null;
-  if (!fy && !fx) return null;
-
-  // ตรวจความสมเหตุสมผล: เลื่อนน้อยมาก = ตรงอยู่แล้ว · เลื่อนมากเกิน = น่าจะจับผิด
-  let maxD = 0;
-  for (let gy = 0; gy <= 10; gy++) for (let gx = 0; gx <= 10; gx++) {
-    const x = (gx / 10) * aw, y = (gy / 10) * ah;
-    maxD = Math.max(maxD, Math.abs(fy ? fy(x, y) : 0), Math.abs(fx ? fx(x, y) : 0));
-  }
-  if (maxD < 1.2 || maxD > 0.07 * Math.max(aw, ah)) return null;
 
   // คำนวณการเลื่อนบนตารางหยาบ (ทุก 8 px ของภาพวิเคราะห์) แล้วขยายเป็นความละเอียดจริงแบบนุ่มนวล
   const gw = Math.max(2, Math.ceil(aw / 8) + 1), gh = Math.max(2, Math.ceil(ah / 8) + 1);
   const gdx = new cv.Mat(gh, gw, cv.CV_32FC1), gdy = new cv.Mat(gh, gw, cv.CV_32FC1);
-  const rowY = fy?.rowEval, rowX = fx?.rowEval;
   for (let j = 0; j < gh; j++) {
     const y = (j / (gh - 1)) * ah;
-    const ey = rowY ? rowY(y) : null, ex = rowX ? rowX(y) : null;
+    // ช่วงที่แถวนี้อยู่ หรือสองช่วงที่แถวนี้อยู่ระหว่างกลาง (ในแถบว่าง)
+    let a = null, b = null, t = 0;
+    const inside = regions.find((r) => y >= r.y0 && y < r.y1);
+    if (inside) a = inside;
+    else {
+      const above = regions.filter((r) => r.y1 <= y).pop();
+      const below = regions.find((r) => r.y0 > y);
+      if (above && below) { a = above; b = below; t = (y - above.y1) / (below.y0 - above.y1); }
+      else a = above || below;
+    }
+    const A = a ? rowFns(a, y) : {}, B = b ? rowFns(b, y) : {};
+    t = t * t * (3 - 2 * t);
     for (let i = 0; i < gw; i++) {
       const x = (i / (gw - 1)) * aw;
-      gdx.data32F[j * gw + i] = ex ? ex(x) / s : 0;
-      gdy.data32F[j * gw + i] = ey ? ey(x) / s : 0;
+      const vx = (A.ex ? A.ex(x) : 0) * (1 - t) + (B.ex ? B.ex(x) : 0) * t;
+      const vy = (A.ey ? A.ey(x) : 0) * (1 - t) + (B.ey ? B.ey(x) : 0) * t;
+      gdx.data32F[j * gw + i] = vx / s;
+      gdy.data32F[j * gw + i] = vy / s;
     }
   }
   const mapX = new cv.Mat(), mapY = new cv.Mat();
@@ -245,6 +319,44 @@ function straightenLines(src) {
   mapX.delete();
   mapY.delete();
   return out;
+}
+
+/**
+ * แบ่งหน้าเป็นช่วงตามแถบว่างแนวนอน (แถวที่แทบไม่มีหมึก ต่อกันสูงพอ)
+ * คืน [{ y0, y1 }] เฉพาะช่วงที่มีเนื้อหา · ไม่มีแถบว่างเลย = ทั้งหน้าเป็นช่วงเดียว
+ */
+function splitByGaps(ink, w, h) {
+  const d = ink.data;
+  // ไม่นับขอบซ้ายขวา 3% (เงา/ขอบกระดาษที่เหลือ)
+  const x0 = Math.round(w * 0.03), x1 = Math.round(w * 0.97);
+  const blank = new Uint8Array(h);
+  const limit = (x1 - x0) * 0.012;
+  for (let y = 0; y < h; y++) {
+    let n = 0;
+    for (let x = x0, i = y * w + x0; x < x1; x++, i++) if (d[i]) n++;
+    blank[y] = n <= limit ? 1 : 0;
+  }
+  const minGap = Math.max(8, Math.round(h * 0.012));
+  const regions = [];
+  let start = -1, gapRun = 0;
+  for (let y = 0; y <= h; y++) {
+    const b = y === h ? 1 : blank[y];
+    if (!b) {
+      if (start < 0) start = y;
+      gapRun = 0;
+    } else if (start >= 0) {
+      gapRun++;
+      if (gapRun >= minGap || y === h) {
+        regions.push({ y0: start, y1: y - gapRun + 1 });
+        start = -1;
+        gapRun = 0;
+      }
+    }
+  }
+  // ช่วงเล็กมาก (เศษ/จุด/ลายเซ็น) รวมเข้ากับช่วงข้างเคียงที่ใกล้ที่สุด ถ้าห่างกันไม่มาก ไม่งั้นทิ้ง (ไม่ดัด = ปลอดภัย)
+  const minH = Math.max(12, h * 0.03);
+  const out = regions.filter((r) => r.y1 - r.y0 >= minH);
+  return out.length ? out : [{ y0: 0, y1: h }];
 }
 
 /**
@@ -307,10 +419,10 @@ function lineCurves(bin, w, h, joinText) {
  * นอกช่วงที่มีตัวอย่าง ค่าการเลื่อนจะค่อย ๆ ลดเป็น 0 (ไม่เดาส่วนที่ไม่มีเส้นอ้างอิง)
  * คืน null ถ้าการดัดไม่ทำให้เส้นตรงขึ้นชัดเจน
  */
-function fitField(samples, aw, ah) {
+function fitField(samples, aw, ah, NX = 4, NY = 3) {
   if (samples.length < 20) return null;
-  // พหุนามดีกรีต่ำ: ความโค้งของกระดาษเป็นแบบเรียบ ๆ ทั้งแผ่น (ดีกรีสูงทำให้เส้นเป็นคลื่น)
-  const NX = 4, NY = 3, K = NX * NY;
+  // พหุนามดีกรีต่ำ: ความโค้งของกระดาษเป็นแบบเรียบ ๆ (ดีกรีสูงทำให้เส้นเป็นคลื่น)
+  const K = NX * NY;
   const nx = (x) => (x / aw) * 2 - 1, ny = (y) => (y / ah) * 2 - 1;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const [x, y] of samples) { x0 = Math.min(x0, nx(x)); x1 = Math.max(x1, nx(x)); y0 = Math.min(y0, ny(y)); y1 = Math.max(y1, ny(y)); }
@@ -414,6 +526,91 @@ function solve(A, b) {
  * ฟิลเตอร์ + ปรับภาพ
  * contrast 0..1 (0.5 = ปกติ) · brightness −1..1 (0 = ปกติ) · sharpness 0..1 (0 = ไม่เพิ่มความคม)
  */
+/* ---------- เติมขอบ: พื้นหลังที่ติดเข้ามาตรงขอบกระดาษที่แหว่ง/พับ ---------- */
+
+/**
+ * หาส่วนที่ "ไม่ใช่กระดาษ" ซึ่งต่อเนื่องมาจากขอบภาพ (โต๊ะ เงา มุมที่พับหาย) แล้วเติมด้วยสีกระดาษ
+ * - ดูเฉพาะแถบรอบขอบภาพ (ไม่เกิน 12% ของด้านสั้น) — ตัวหนังสือ/ตารางกลางหน้าไม่ถูกแตะ
+ * - ตัดเส้นบาง ๆ ออกก่อน (ตัวหนังสือ เส้นตาราง) จึงเหลือแต่ก้อนพื้นหลังใหญ่ ๆ
+ * rgba = ภาพ 4 ช่อง (แก้ในที่) · คืน true ถ้ามีการเติม
+ */
+function fillEdgeBackground(rgba) {
+  const W = rgba.cols, H = rgba.rows;
+  const s = Math.min(1, 700 / Math.max(W, H)); // วิเคราะห์ที่ภาพย่อ
+  const w = Math.max(8, Math.round(W * s)), h = Math.max(8, Math.round(H * s));
+  const small = new cv.Mat();
+  cv.resize(rgba, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+  const d = small.data;
+
+  // สีกระดาษ = ค่ากลางของพื้นที่กลางหน้า (ตัดส่วนที่เข้มออก = ตัวหนังสือ)
+  const rs = [], gs = [], bs = [];
+  for (let y = Math.round(h * 0.2); y < h * 0.8; y += 2) {
+    for (let x = Math.round(w * 0.2); x < w * 0.8; x += 2) {
+      const i = (y * w + x) * 4;
+      rs.push(d[i]); gs.push(d[i + 1]); bs.push(d[i + 2]);
+    }
+  }
+  const pct = (a, p) => { a.sort((m, n) => m - n); return a[Math.min(a.length - 1, Math.floor(a.length * p))]; };
+  // ใช้เปอร์เซ็นไทล์สูง: พื้นกระดาษสว่างกว่าหมึกเสมอ
+  const paper = [pct(rs, 0.7), pct(gs, 0.7), pct(bs, 0.7)];
+  const paperL = (paper[0] + paper[1] + paper[2]) / 3;
+
+  // พิกเซลที่ต่างจากกระดาษชัดเจน: เข้มกว่ามาก หรือสีเพี้ยนไปมาก (ลายไม้/เงาสีน้ำตาล)
+  const band = Math.round(Math.min(w, h) * 0.12);
+  const mask = new cv.Mat(h, w, cv.CV_8UC1, new cv.Scalar(0));
+  const m = mask.data;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (x >= band && y >= band && x < w - band && y < h - band) continue;
+      const i = (y * w + x) * 4;
+      const L = (d[i] + d[i + 1] + d[i + 2]) / 3;
+      const dc = Math.abs(d[i] - paper[0]) + Math.abs(d[i + 1] - paper[1]) + Math.abs(d[i + 2] - paper[2]);
+      if (L < paperL * 0.72 || dc > 110) m[y * w + x] = 255;
+    }
+  }
+  small.delete();
+  // ตัดเส้นบาง/ตัวหนังสือออก เหลือก้อนใหญ่
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
+  cv.morphologyEx(mask, mask, cv.MORPH_OPEN, k);
+  k.delete();
+
+  // เก็บเฉพาะก้อนที่แตะขอบภาพ
+  const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+  const n = cv.connectedComponentsWithStats(mask, labels, stats, cents, 8, cv.CV_32S);
+  cents.delete();
+  const S = stats.data32S, Lb = labels.data32S;
+  const keep = new Uint8Array(n);
+  let any = false;
+  for (let l = 1; l < n; l++) {
+    const x = S[l * 5], y = S[l * 5 + 1], bw = S[l * 5 + 2], bh = S[l * 5 + 3], area = S[l * 5 + 4];
+    const touches = x === 0 || y === 0 || x + bw >= w || y + bh >= h;
+    if (touches && area >= 12) { keep[l] = 1; any = true; }
+  }
+  stats.delete();
+  if (!any) { labels.delete(); mask.delete(); return false; }
+  for (let i = 0; i < m.length; i++) m[i] = keep[Lb[i]] ? 255 : 0;
+  labels.delete();
+  // ขยายเล็กน้อยให้กินขอบเงาที่ติดอยู่ แล้วขยายกลับเป็นขนาดจริง
+  const k2 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  cv.dilate(mask, mask, k2);
+  k2.delete();
+  const big = new cv.Mat();
+  cv.resize(mask, big, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR);
+  mask.delete();
+  // เติมสีกระดาษ (ขอบนุ่มตามค่าความทึบของหน้ากาก)
+  const D = rgba.data, B = big.data;
+  for (let i = 0, p = 0; p < B.length; p++, i += 4) {
+    const a = B[p];
+    if (!a) continue;
+    const t = a / 255;
+    D[i] = D[i] * (1 - t) + paper[0] * t;
+    D[i + 1] = D[i + 1] * (1 - t) + paper[1] * t;
+    D[i + 2] = D[i + 2] * (1 - t) + paper[2] * t;
+  }
+  big.delete();
+  return true;
+}
+
 function applyFilter(rgba, { filter, contrast, brightness = 0, sharpness = 0 }) {
   const rgb = new cv.Mat();
   cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);

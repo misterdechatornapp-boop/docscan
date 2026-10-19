@@ -9,14 +9,14 @@ import { openEraser, drawStrokes, rotateStrokes } from './eraser.js';
 /** ค่าการปรับภาพล่าสุดที่ผู้ใช้เลือก (ใช้กับภาพถัดไป) */
 const lastLook = () => ({
   filter: settings.filter, contrast: settings.contrast, brightness: settings.brightness,
-  sharpness: settings.sharpness, straighten: settings.straighten,
+  sharpness: settings.sharpness, straighten: settings.straighten, fillEdges: settings.fillEdges,
 });
 import { buildPdf, buildJpgs, canShareFiles, shareFiles, downloadFiles, QUALITIES } from './exporter.js';
 import { openCameraView, cameraSupported } from './camera.js';
 import Sortable from '../vendor/sortable.esm.js';
 import { VERSION, APP_NAME, TRASH_DAYS } from './config.js';
 
-const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, brightness: 0, sharpness: 0.3, straighten: true, sound: 'on', camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
+const DEFAULT_SETTINGS = { filter: 'color', contrast: 0.5, brightness: 0, sharpness: 0.3, straighten: true, fillEdges: true, sound: 'on', camera: 'app', camMode: 'batch', pageSize: 'a4', quality: 'medium', format: 'pdf' };
 let settings = { ...DEFAULT_SETTINGS };
 
 const app = $('#app');
@@ -31,6 +31,43 @@ function blobUrl(blob) {
   urls.push(u);
   return u;
 }
+// ภาพย่อ/ภาพหน้าที่ใช้ซ้ำ: จำ URL ไว้ตาม id + ขนาดไฟล์ วาดหน้าจอใหม่แล้วภาพเดิมขึ้นทันที ไม่กะพริบ
+const urlCache = new Map();          // key → url (ใช้ล่าสุดอยู่ท้าย)
+const decoded = new Set();           // url ที่ถอดรหัสภาพแล้ว แสดงได้ทันที
+const CACHE_LIMIT = { p: 10, t: 300, d: 300 };
+function cachedUrl(kind, id, blob) {
+  if (!blob) return '';
+  const key = `${kind}:${id}:${blob.size}`;
+  let u = urlCache.get(key);
+  if (u) {
+    urlCache.delete(key);
+    urlCache.set(key, u);
+    return u;
+  }
+  u = URL.createObjectURL(blob);
+  urlCache.set(key, u);
+  const mine = [...urlCache.keys()].filter((k) => k.startsWith(kind + ':'));
+  for (const k of mine.slice(0, Math.max(0, mine.length - CACHE_LIMIT[kind]))) {
+    const old = urlCache.get(k);
+    urlCache.delete(k);
+    decoded.delete(old);
+    setTimeout(() => URL.revokeObjectURL(old), 5000);
+  }
+  return u;
+}
+/** ถอดรหัสภาพไว้ล่วงหน้า (ตอนแสดงจริงจะขึ้นทันที) */
+function preloadUrl(u) {
+  if (!u || decoded.has(u)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const im = new Image();
+    const done = () => { decoded.add(u); resolve(); };
+    // onload แล้วค่อย decode · decode() อาจค้างเมื่อหน้าจอไม่ได้วาด จึงมีเวลารอสูงสุด
+    im.onload = () => Promise.race([im.decode().catch(() => {}), new Promise((r) => setTimeout(r, 400))]).then(done);
+    im.onerror = () => resolve();
+    im.src = u;
+  });
+}
+
 function releaseUrls() {
   // คืนแบบหน่วงเวลา: ภาพของหน้าเดิมที่ยังโหลดค้างอยู่จะไม่ขึ้น error
   const old = urls;
@@ -76,7 +113,46 @@ async function renderRoute() {
     toast('เกิดข้อผิดพลาด: ' + err.message);
   }
 }
-window.addEventListener('hashchange', route);
+// ทิศของการเปลี่ยนหน้า: ลึกขึ้น = เลื่อนจากขวา · ย้อนกลับ = เลื่อนจากซ้าย
+const DEPTH = { home: 0, trash: 1, doc: 2, page: 3 };
+const depthOf = (r) => (r.view === 'home' && r.folderId ? 1 : DEPTH[r.view]);
+let lastRoute = parseRoute();
+let nextTransition = null; // บังคับชนิดการเปลี่ยนหน้าครั้งถัดไป (เช่น ปัดเปลี่ยนหน้า)
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+window.addEventListener('hashchange', () => {
+  const to = parseRoute(), from = lastRoute;
+  lastRoute = to;
+  let type = nextTransition;
+  nextTransition = null;
+  if (!type) {
+    if (to.view === 'page' && from.view === 'page' && to.docId === from.docId) type = to.index > from.index ? 'next-in' : 'prev-in';
+    else type = depthOf(to) > depthOf(from) ? 'forward' : depthOf(to) < depthOf(from) ? 'backward' : 'fade';
+  }
+  navigateWith(type);
+});
+
+function navigateWith(type) {
+  if (!document.startViewTransition || reduceMotion.matches || document.querySelector('dialog[open]')) return route();
+  const html = document.documentElement;
+  html.dataset.vt = type;
+  let ran = false;
+  const t = document.startViewTransition(() => {
+    if (ran) return;
+    ran = true;
+    return route();
+  });
+  t.ready.catch(() => {});
+  t.finished.catch(() => {}).finally(() => { if (html.dataset.vt === type) delete html.dataset.vt; });
+  // กันค้าง: ถ้าเบราว์เซอร์ยังไม่เริ่มแอนิเมชัน (เช่น แอปอยู่เบื้องหลัง) ให้เปลี่ยนหน้าเลยไม่ต้องรอ
+  setTimeout(() => {
+    if (ran) return;
+    ran = true;
+    t.skipTransition();
+    route();
+  }, 350);
+  return t.updateCallbackDone.catch(() => {});
+}
 
 /* ---------- ข้อมูล ---------- */
 async function liveDocs() {
@@ -124,6 +200,7 @@ async function buildPage(docId, srcCanvas, opts, existing) {
     filter: opts.filter, rotation: opts.rotation || 0, contrast: opts.contrast ?? 0.5,
     brightness: opts.brightness ?? 0, sharpness: opts.sharpness ?? 0,
     straighten: !!opts.straighten,
+    fillEdges: !!opts.fillEdges,
     erase: opts.erase || [],
     needsReview: !!opts.needsReview,
   });
@@ -137,6 +214,36 @@ function enqueue(fn) {
   const p = queue.then(fn);
   queue = p.catch(() => {});
   return p;
+}
+
+/* ---------- หน้าใหม่ที่กำลังสร้างเบื้องหลัง (แสดงเป็นช่องรอในหน้าเอกสาร) ---------- */
+const pending = new Map(); // docId → จำนวนหน้าที่กำลังสร้าง
+let gridDragging = false;
+let refreshWanted = false;
+
+function trackNewPage(docId, job) {
+  pending.set(docId, (pending.get(docId) || 0) + 1);
+  refreshDocView(docId);
+  return job
+    .catch((err) => { console.error(err); toast('บันทึกไม่สำเร็จ: ' + err.message); throw err; })
+    .finally(() => {
+      const n = (pending.get(docId) || 1) - 1;
+      if (n) pending.set(docId, n); else pending.delete(docId);
+      refreshDocView(docId);
+    });
+}
+
+/** วาดหน้าเอกสารใหม่ถ้ากำลังเปิดอยู่ (ภาพเดิมใช้ URL ที่จำไว้ จึงไม่กะพริบ) */
+function refreshDocView(docId) {
+  const r = parseRoute();
+  if (r.view !== 'doc' || r.docId !== docId) return;
+  if (gridDragging) { refreshWanted = true; return; }
+  route();
+}
+
+/** สร้างเอกสารเปล่าไว้ก่อน เพื่อเปิดหน้าเอกสารได้ทันทีขณะหน้าแรกยังสร้างอยู่ */
+async function ensureDoc(docId, folderId) {
+  if (!(await db.get('docs', docId))) await db.put('docs', await newDocRecord(docId, folderId));
 }
 
 let persistAsked = false;
@@ -163,6 +270,7 @@ async function openCamera(docId) {
   const target = { docId: docId || db.uid(), folderId: currentFolderId() };
   if (settings.camera === 'system' || !cameraSupported()) return openSystemCamera(target);
   let saved = 0;
+  const ready = () => (target.ready ||= ensureDoc(target.docId, target.folderId));
   const res = await openCameraView({
     mode: settings.camMode,
     sound: settings.sound !== 'off',
@@ -170,18 +278,18 @@ async function openCamera(docId) {
     onSystemCamera: () => openSystemCamera(target),
     onBatchShot: (blob) => {
       saved++;
-      enqueue(() => autoPage(target.docId, blob, target.folderId))
-        .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
+      trackNewPage(target.docId, ready().then(() => enqueue(() => autoPage(target.docId, blob, target.folderId)))).catch(() => {});
     },
     onShot: async (canvas) => {
       const r = await openEditor({ canvas, ...lastLook(), onContinue: () => {} });
       if (!r) { freeCanvas(canvas); return 'cancel'; }
       rememberLook(r);
       saved++;
-      enqueue(async () => {
-        const page = await buildPage(target.docId, canvas, r);
+      freeCanvas(r.preview);
+      trackNewPage(target.docId, ready().then(() => enqueue(async () => {
+        const page = await buildPage(target.docId, canvas, { ...r, preview: null });
         await appendPages(target.docId, [page], target.folderId);
-      }).catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message)).finally(() => freeCanvas(canvas));
+      })).finally(() => freeCanvas(canvas))).catch(() => {});
       return r.cont ? 'saved' : 'done';
     },
   });
@@ -191,9 +299,8 @@ async function openCamera(docId) {
     return;
   }
   if (!saved) return;
-  const prog = progress('กำลังจัดขอบและบันทึก…');
-  await queue;
-  prog.close();
+  // ไปหน้าเอกสารทันที หน้าที่ยังจัดขอบอยู่แสดงเป็นช่องรอ
+  await ready();
   if (parseRoute().view === 'doc' && parseRoute().docId === target.docId) route();
   else go(`#/doc/${target.docId}`);
 }
@@ -221,7 +328,7 @@ async function autoPage(docId, blob, folderId) {
 
 /** จำฟิลเตอร์/คอนทราสต์ล่าสุดไว้ใช้กับภาพถัดไป */
 function rememberLook(r) {
-  const keys = ['filter', 'contrast', 'brightness', 'sharpness', 'straighten'];
+  const keys = ['filter', 'contrast', 'brightness', 'sharpness', 'straighten', 'fillEdges'];
   if (keys.every((k) => settings[k] === r[k])) return;
   for (const k of keys) settings[k] = r[k];
   db.setMeta('settings', settings);
@@ -247,8 +354,9 @@ camInput.addEventListener('change', () => {
  */
 async function systemBatchShot(file, target) {
   target.count = (target.count || 0) + 1;
-  enqueue(() => autoPage(target.docId, file, target.folderId))
-    .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message));
+  await ensureDoc(target.docId, target.folderId);
+  trackNewPage(target.docId, enqueue(() => autoPage(target.docId, file, target.folderId))).catch(() => {});
+  if (!(parseRoute().view === 'doc' && parseRoute().docId === target.docId)) go(`#/doc/${target.docId}`);
   const next = await modal(`
     <h2>ถ่ายแล้ว ${target.count} หน้า</h2>
     <p class="muted">แอปจัดขอบและปรับสีให้เองเบื้องหลัง ไปแก้ทีหลังได้ในหน้าเอกสาร</p>
@@ -266,16 +374,7 @@ async function systemBatchShot(file, target) {
       });
     },
   });
-  if (next !== 'more') {
-    const prog = progress('กำลังจัดขอบและบันทึก…');
-    await queue;
-    prog.close();
-  } else {
-    await queue;
-  }
-  // ไปหน้าเอกสาร (ถ้ากดถ่ายต่อแล้วยกเลิกกล้อง ก็จะเห็นหน้าเอกสารพอดี)
-  if (parseRoute().view === 'doc' && parseRoute().docId === target.docId) route();
-  else go(`#/doc/${target.docId}`);
+  return next;
 }
 
 galInput.addEventListener('change', () => {
@@ -303,42 +402,25 @@ async function editAndSave(file, target, fromCamera) {
     return;
   }
   rememberLook(res);
-  toast('กำลังบันทึก…', { ms: 0 });
-  try {
-    await enqueue(async () => {
-      const page = await buildPage(docId, canvas, res);
-      await appendPages(docId, [page], target?.folderId);
-    });
-    toast('บันทึกแล้ว');
-  } catch (err) {
-    console.error(err);
-    toast('บันทึกไม่สำเร็จ: ' + err.message);
-  } finally {
-    freeCanvas(canvas);
-  }
+  freeCanvas(res.preview);
+  await ensureDoc(docId, target?.folderId);
+  trackNewPage(docId, enqueue(async () => {
+    const page = await buildPage(docId, canvas, { ...res, preview: null });
+    await appendPages(docId, [page], target?.folderId);
+  }).finally(() => freeCanvas(canvas))).catch(() => {});
   if (parseRoute().docId === docId && parseRoute().view === 'doc') route();
   else go(`#/doc/${docId}`);
 }
 
 async function importMany(files, target) {
   const docId = target?.docId || db.uid();
-  const prog = progress(`กำลังเตรียม…`);
-  let failed = 0;
-  try {
-    for (let i = 0; i < files.length; i++) {
-      prog.update(`กำลังประมวลผลภาพ ${i + 1}/${files.length}`);
-      try {
-        await enqueue(() => autoPage(docId, files[i], target?.folderId));
-      } catch (err) {
-        console.error(err);
-        failed++;
-      }
-    }
-  } finally {
-    prog.close();
-  }
+  await ensureDoc(docId, target?.folderId);
+  const jobs = files.map((f) => trackNewPage(docId, enqueue(() => autoPage(docId, f, target?.folderId))));
+  if (parseRoute().docId === docId && parseRoute().view === 'doc') route();
+  else go(`#/doc/${docId}`);
+  const results = await Promise.allSettled(jobs);
+  const failed = results.filter((r) => r.status === 'rejected').length;
   toast(failed ? `นำเข้าไม่สำเร็จ ${failed} ภาพ` : `นำเข้า ${files.length} ภาพแล้ว`);
-  if ((await db.get('docs', docId))) go(`#/doc/${docId}`);
 }
 
 /* ---------- หน้ารายการเอกสาร ---------- */
@@ -430,7 +512,7 @@ function docRow(d) {
   return `
     <div class="row" data-id="${d.id}">
       <button class="row-main" data-act="open-doc">
-        <span class="row-thumb">${d.thumb ? `<img src="${blobUrl(d.thumb)}" alt="">` : icon('file')}</span>
+        <span class="row-thumb">${d.thumb ? `<img src="${cachedUrl('d', d.id, d.thumb)}" alt="">` : icon('file')}</span>
         <span class="row-text">
           <span class="row-title">${esc(d.name)}</span>
           <span class="row-sub">${fmtSize(d.size || 0)} <span class="badge">${d.pageIds.length}</span></span>
@@ -554,6 +636,7 @@ async function renderDoc(docId) {
   const sel = selection;
   if (sel) [...sel.ids].forEach((id) => { if (!doc.pageIds.includes(id)) sel.ids.delete(id); });
   const n = sel?.ids.size || 0;
+  const waiting = pending.get(docId) || 0;
 
   const header = sel
     ? `<button class="icon-btn" data-act="sel-cancel" aria-label="เลิกเลือก">${icon('close')}</button>
@@ -589,14 +672,15 @@ async function renderDoc(docId) {
           const on = sel?.ids.has(p.id);
           return `
           <button class="page-card ${on ? 'selected' : ''}" data-id="${p.id}" data-act="open-page" aria-label="หน้า ${i + 1}" ${sel ? `aria-pressed="${!!on}"` : ''}>
-            <img src="${blobUrl(p.thumb)}" alt="" draggable="false">
+            <img src="${cachedUrl('t', p.id, p.thumb)}" alt="" draggable="false">
             <span class="page-no">${i + 1}</span>
             ${p.needsReview ? '<span class="page-flag">ตรวจขอบ</span>' : ''}
             ${sel ? `<span class="page-check">${icon('check')}</span>` : ''}
           </button>`;
         }).join('')}
+        ${Array.from({ length: sel ? 0 : waiting }, () => '<div class="page-card skeleton" aria-label="กำลังจัดขอบ"><span class="spinner"></span></div>').join('')}
       </div>
-      ${!pages.length ? '<div class="empty"><div>เอกสารนี้ยังไม่มีหน้า</div><div class="muted">ถ่ายหรือเลือกรูปเพื่อเพิ่มหน้า</div></div>' : ''}
+      ${!pages.length && !waiting ? '<div class="empty"><div>เอกสารนี้ยังไม่มีหน้า</div><div class="muted">ถ่ายหรือเลือกรูปเพื่อเพิ่มหน้า</div></div>' : ''}
     </main>
     ${footer}`;
 
@@ -607,7 +691,7 @@ async function renderDoc(docId) {
     // แตะค้างโดยไม่ขยับนิ้ว = เข้าโหมดเลือก (ถ้าขยับระหว่างค้าง = ลากเรียงหน้า)
     let pressTimer;
     let startXY = null;
-    if (pages.length > 1) {
+    if (pages.length > 1 && !waiting) {
       sortable = new Sortable(grid, {
         animation: 160,
         delay: 220,
@@ -616,14 +700,20 @@ async function renderDoc(docId) {
         fallbackTolerance: 4,
         ghostClass: 'drag-ghost',
         chosenClass: 'drag-chosen',
-        onStart: () => clearTimeout(pressTimer),
+        filter: '.skeleton',
+        onStart: () => { clearTimeout(pressTimer); gridDragging = true; },
         onEnd: async (e) => {
-          if (e.oldIndex === e.newIndex) return;
-          const ids = [...grid.children].map((el) => el.dataset.id);
+          gridDragging = false;
+          if (e.oldIndex === e.newIndex) {
+            if (refreshWanted) { refreshWanted = false; route(); }
+            return;
+          }
+          const ids = [...grid.children].map((el) => el.dataset.id).filter(Boolean);
           grid.querySelectorAll('.page-no').forEach((el, i) => { el.textContent = i + 1; });
           const fresh = await db.get('docs', docId);
           fresh.pageIds = ids;
           await refreshDoc(fresh);
+          if (refreshWanted) { refreshWanted = false; route(); }
         },
       });
     }
@@ -704,6 +794,8 @@ async function renderPage(docId, index) {
   const i = Math.min(index, doc.pageIds.length - 1);
   const page = await db.get('pages', doc.pageIds[i]);
   const n = doc.pageIds.length;
+  const fullUrl = cachedUrl('p', page.id, page.processed);
+  const ready = decoded.has(fullUrl);
 
   app.innerHTML = `
     <header class="topbar">
@@ -712,7 +804,7 @@ async function renderPage(docId, index) {
       <span class="icon-btn-spacer"></span>
     </header>
     <main class="viewer" id="viewer">
-      <img src="${blobUrl(page.processed)}" alt="หน้า ${i + 1}">
+      <img class="pg-img" src="${ready ? fullUrl : cachedUrl('t', page.id, page.thumb)}" alt="หน้า ${i + 1}" draggable="false">
       ${i > 0 ? `<button class="nav-btn prev" data-act="prev" aria-label="หน้าก่อน">${icon('back')}</button>` : ''}
       ${i < n - 1 ? `<button class="nav-btn next" data-act="next" aria-label="หน้าถัดไป">${icon('next')}</button>` : ''}
     </main>
@@ -724,80 +816,168 @@ async function renderPage(docId, index) {
       <button class="tool danger" data-act="delete">${icon('trash')}<span>ลบหน้า</span></button>
     </footer>`;
 
-  // ปัดซ้าย/ขวาเพื่อเปลี่ยนหน้า
   const viewer = $('#viewer');
-  let sx = null;
-  viewer.addEventListener('pointerdown', (e) => { sx = e.clientX; });
-  viewer.addEventListener('pointerup', (e) => {
-    if (sx === null) return;
-    const dx = e.clientX - sx;
-    sx = null;
-    if (dx < -60 && i < n - 1) location.replace(`#/doc/${docId}/page/${i + 1}`);
-    else if (dx > 60 && i > 0) location.replace(`#/doc/${docId}/page/${i - 1}`);
+  const img = $('.pg-img');
+  // เปิดหน้าทันทีด้วยภาพย่อ แล้วแทนด้วยภาพจริงเมื่อถอดรหัสเสร็จ · โหลดหน้าข้าง ๆ ไว้ล่วงหน้า
+  if (!ready) preloadUrl(fullUrl).then(() => { if (img.isConnected && !turn) img.src = fullUrl; });
+  for (const j of [i + 1, i - 1]) {
+    if (j >= 0 && j < n) db.get('pages', doc.pageIds[j]).then((p) => p && preloadUrl(cachedUrl('p', p.id, p.processed)));
+  }
+
+  /* ----- ปัดเปลี่ยนหน้า: ภาพเลื่อนตามนิ้ว ----- */
+  let drag = null;
+  viewer.addEventListener('pointerdown', (e) => {
+    if (!e.isPrimary || e.target.closest('button')) return;
+    drag = { x: e.clientX, y: e.clientY, dx: 0, active: false, id: e.pointerId };
   });
+  viewer.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.active) {
+      if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(dy)) return;
+      drag.active = true;
+      viewer.setPointerCapture(e.pointerId);
+      img.classList.add('dragging');
+    }
+    // ไม่มีหน้าถัดไปฝั่งนั้น: ลากได้แค่นิดเดียว (รู้ว่าสุดแล้ว)
+    const edge = (dx > 0 && i === 0) || (dx < 0 && i === n - 1);
+    drag.dx = edge ? dx / 4 : dx;
+    img.style.translate = `${drag.dx}px 0`;
+  });
+  const endDrag = (e) => {
+    if (!drag || (e && e.pointerId !== drag.id)) return;
+    const d = drag;
+    drag = null;
+    if (!d.active) return;
+    img.classList.remove('dragging');
+    const w = viewer.clientWidth;
+    if (d.dx < -w * 0.18 && i < n - 1) slideTo(i + 1);
+    else if (d.dx > w * 0.18 && i > 0) slideTo(i - 1);
+    else img.style.translate = '0 0';
+  };
+  viewer.addEventListener('pointerup', endDrag);
+  viewer.addEventListener('pointercancel', endDrag);
+
+  function slideTo(j) {
+    const dir = j > i ? -1 : 1;
+    img.style.translate = `${dir * viewer.clientWidth}px 0`;
+    nextTransition = dir < 0 ? 'next-in' : 'prev-in';
+    setTimeout(() => location.replace(`#/doc/${docId}/page/${j}`), 170);
+  }
+
+  /* ----- แสดงผลทันที แล้วบันทึกจริงเบื้องหลัง ----- */
+  let turn = 0;      // องศาที่หมุนบนจอแต่ยังไม่ได้แทนด้วยภาพที่บันทึก
+  let jobs = 0;      // งานบันทึกของหน้านี้ที่ยังไม่เสร็จ
+  let preview = null;
+
+  const view = {
+    showPreview(canvas) {
+      preview?.remove();
+      freeCanvas(preview);
+      preview = canvas;
+      canvas.className = 'pg-img pg-preview';
+      img.hidden = true;
+      turn = 0;
+      img.style.rotate = img.style.scale = '';
+      viewer.prepend(canvas);
+    },
+    started() { jobs++; },
+    async finished() {
+      if (--jobs > 0) return;
+      const p = await db.get('pages', page.id);
+      if (!p || !img.isConnected) return;
+      const u = cachedUrl('p', p.id, p.processed);
+      await preloadUrl(u);
+      if (!img.isConnected || jobs) return;
+      img.classList.add('no-anim');
+      img.src = u;
+      img.style.rotate = img.style.scale = '';
+      turn = 0;
+      img.hidden = false;
+      img.offsetWidth; // ให้ค่าใหม่มีผลก่อนเปิดแอนิเมชันกลับ
+      img.classList.remove('no-anim');
+      if (preview) { preview.remove(); freeCanvas(preview); preview = null; }
+    },
+  };
+
+  function applyTurn() {
+    const target = preview || img;
+    const r = viewer.getBoundingClientRect();
+    const w = target.clientWidth || 1, h = target.clientHeight || 1;
+    const odd = Math.abs(turn / 90) % 2 === 1;
+    const s = odd ? Math.min((r.width - 24) / h, (r.height - 24) / w) : 1;
+    target.style.rotate = `${turn}deg`;
+    target.style.scale = String(s);
+  }
 
   app.onclick = async (e) => {
     const t = e.target.closest('[data-act]');
     if (!t) return;
     const act = t.dataset.act;
     if (act === 'back') go(`#/doc/${docId}`);
-    else if (act === 'prev') location.replace(`#/doc/${docId}/page/${i - 1}`);
-    else if (act === 'next') location.replace(`#/doc/${docId}/page/${i + 1}`);
-    else if (act === 'edit') await pageAction(() => reEditPage(doc, page));
+    else if (act === 'prev' && i > 0) slideTo(i - 1);
+    else if (act === 'next' && i < n - 1) slideTo(i + 1);
+    else if (act === 'edit') editPageFlow(docId, page.id, view);
+    else if (act === 'erase') erasePageFlow(docId, page.id, view);
     else if (act === 'rotate') {
-      await pageAction(async () => {
-        const prog = progress('กำลังหมุน…');
-        try {
-          const c = await loadOriginal(page);
-          await buildPage(docId, c, { ...pageLook(page), rotation: ((page.rotation || 0) + 90) % 360, erase: rotateStrokes(page.erase || [], 90) }, page);
-          freeCanvas(c);
-          await refreshDoc(doc);
-        } finally {
-          prog.close();
-        }
-      });
-    } else if (act === 'erase') {
-      await pageAction(() => erasePage(doc, page));
+      // หมุนบนจอทันที · บันทึก (หมุนภาพที่ปรับแล้ว ไม่ต้องคำนวณใหม่ทั้งหมด) ตามลำดับเบื้องหลัง
+      turn += 90;
+      applyTurn();
+      view.started();
+      enqueue(async () => {
+        const p = await db.get('pages', page.id);
+        await rotatePageFast(p);
+        await refreshDoc(await db.get('docs', docId));
+      })
+        .catch((err) => toast('หมุนไม่สำเร็จ: ' + err.message))
+        .finally(() => view.finished());
     } else if (act === 'share') {
-      const files = await buildJpgs([page], { name: `${doc.name}_หน้า${i + 1}`, quality: 'full' });
+      const p = await db.get('pages', page.id);
+      const files = await buildJpgs([p], { name: `${doc.name}_หน้า${i + 1}`, quality: 'full' });
       if (canShareFiles(files)) await shareFiles(files, doc.name).catch((err) => toast('แชร์ไม่สำเร็จ: ' + err.message));
       else downloadFiles(files);
     } else if (act === 'delete') {
       const ok = await confirmBox(`ลบหน้า ${i + 1}?`, 'ลบแล้วกู้คืนไม่ได้', { ok: 'ลบหน้า', danger: true });
       if (!ok) return;
-      doc.pageIds.splice(i, 1);
+      await queue;
+      const fresh = await db.get('docs', docId);
+      fresh.pageIds = fresh.pageIds.filter((id) => id !== page.id);
       await db.del('pages', page.id);
-      await refreshDoc(doc);
+      await refreshDoc(fresh);
       toast('ลบหน้าแล้ว');
-      if (!doc.pageIds.length) go(`#/doc/${docId}`);
-      else location.replace(`#/doc/${docId}/page/${Math.min(i, doc.pageIds.length - 1)}`);
+      if (!fresh.pageIds.length) go(`#/doc/${docId}`);
+      else { nextTransition = 'fade'; location.replace(`#/doc/${docId}/page/${Math.min(i, fresh.pageIds.length - 1)}`); }
     }
   };
+}
+
+/** หมุนหน้า 90° ตามเข็มนาฬิกา โดยหมุนภาพที่ปรับแล้วตรง ๆ (เร็ว) และจำค่าไว้สำหรับคำนวณใหม่ครั้งหน้า */
+async function rotatePageFast(p) {
+  const src = await loadCanvas(p.processed, Infinity);
+  const c = document.createElement('canvas');
+  c.width = src.height;
+  c.height = src.width;
+  const ctx = c.getContext('2d');
+  ctx.translate(c.width, 0);
+  ctx.rotate(Math.PI / 2);
+  ctx.drawImage(src, 0, 0);
+  freeCanvas(src);
+  const processed = await toBlob(c, 0.88);
+  const tc = scaleCanvas(c, THUMB_SIDE);
+  const thumb = await toBlob(tc, 0.7);
+  freeCanvas(tc);
+  freeCanvas(c);
+  Object.assign(p, { processed, thumb, rotation: ((p.rotation || 0) + 90) % 360, erase: rotateStrokes(p.erase || [], 90) });
+  await db.put('pages', p);
 }
 
 /** ค่าการจัดหน้าเดิมของหน้า (ใช้คำนวณใหม่จากภาพต้นฉบับ) */
 const pageLook = (page) => ({
   corners: page.corners, filter: page.filter, contrast: page.contrast ?? 0.5,
   brightness: page.brightness ?? 0, sharpness: page.sharpness ?? 0,
-  rotation: page.rotation || 0, straighten: page.straighten ?? false, needsReview: page.needsReview,
-  erase: page.erase || [],
+  rotation: page.rotation || 0, straighten: page.straighten ?? false, fillEdges: page.fillEdges ?? false,
+  needsReview: page.needsReview, erase: page.erase || [],
 });
-
-// กันกดซ้ำระหว่างทำงาน + แจ้ง error ให้เห็น + วาดหน้าใหม่ทุกครั้ง (ไม่ค้างหน้าเดิม)
-let pageBusy = false;
-async function pageAction(fn) {
-  if (pageBusy) return toast('กำลังทำงาน รอสักครู่…');
-  pageBusy = true;
-  try {
-    await fn();
-  } catch (err) {
-    console.error(err);
-    toast('ทำรายการไม่สำเร็จ: ' + (err?.message || err), { ms: 5000 });
-  } finally {
-    pageBusy = false;
-    route();
-  }
-}
 
 /**
  * เปิดภาพต้นฉบับของหน้า · ถ้าต้นฉบับเสีย (iPhone อ่านไม่ได้) ใช้ภาพที่ปรับแล้วเป็นต้นฉบับใหม่แทน
@@ -812,7 +992,7 @@ async function loadOriginal(page) {
     Object.assign(page, {
       original: await toBlob(c, 0.92),
       corners: FULL_FRAME.map((p) => [...p]), mids: null,
-      rotation: 0, erase: [], straighten: false, needsReview: false,
+      rotation: 0, erase: [], straighten: false, fillEdges: false, needsReview: false,
     });
     await db.put('pages', page);
     toast('ภาพต้นฉบับหน้านี้เปิดไม่ได้ จึงใช้ภาพที่ปรับแล้วเป็นต้นฉบับแทน', { ms: 5000 });
@@ -824,6 +1004,7 @@ async function loadOriginal(page) {
 async function refilterPages(doc, ids, filter) {
   const prog = progress('กำลังปรับฟิลเตอร์…');
   try {
+    await queue;
     for (let i = 0; i < ids.length; i++) {
       prog.update(`กำลังปรับฟิลเตอร์ ${i + 1}/${ids.length}`);
       const page = await db.get('pages', ids[i]);
@@ -839,62 +1020,98 @@ async function refilterPages(doc, ids, filter) {
   }
 }
 
-/** ลบข้อความ: เปิดหน้าระบาย แล้วคำนวณหน้าใหม่จากต้นฉบับพร้อมรอยลบ */
-async function erasePage(doc, page) {
-  const loading = progress('กำลังเปิดภาพ…');
-  let base;
+let flowOpen = false; // กันเปิดหน้าปรับภาพ/ลบข้อความซ้อนกัน
+
+/** ขอบ/ฟิลเตอร์: ปิดหน้าปรับภาพแล้วแสดงพรีวิวทันที คำนวณภาพความละเอียดเต็มเบื้องหลัง */
+async function editPageFlow(docId, pageId, view) {
+  if (flowOpen) return;
+  flowOpen = true;
+  let canvas = null;
   try {
-    // ภาพฐานที่ยังไม่มีรอยลบ (รอยเดิมแก้/ย้อนกลับได้)
-    if (page.erase?.length) {
-      const c = await loadOriginal(page);
-      base = await processCanvas(c, { ...pageLook(page), erase: [] });
-      freeCanvas(c);
-    } else {
-      base = await loadCanvas(page.processed, Infinity);
+    const spin = progress('กำลังเปิดภาพ…');
+    let p;
+    try {
+      await queue; // ให้งานก่อนหน้า (เช่น หมุน) เสร็จก่อน จะได้แก้จากข้อมูลล่าสุด
+      p = await db.get('pages', pageId);
+      canvas = await loadOriginal(p);
+    } finally {
+      spin.close();
     }
+    const res = await openEditor({ canvas, ...pageLook(p) });
+    if (!res) return;
+    rememberLook(res);
+    let erase = p.erase || [];
+    if (erase.length) {
+      const same = JSON.stringify([res.corners, res.straighten, res.fillEdges]) === JSON.stringify([p.corners, p.straighten ?? false, p.fillEdges ?? false]);
+      if (same) erase = rotateStrokes(erase, (res.rotation || 0) - (p.rotation || 0));
+      else { erase = []; toast('ล้างรอยลบข้อความแล้ว เพราะเปลี่ยนขอบภาพ', { ms: 4000 }); }
+    }
+    if (res.preview) {
+      if (erase.length) drawStrokes(res.preview.getContext('2d'), res.preview.width, res.preview.height, erase);
+      view.showPreview(res.preview);
+    }
+    const src = canvas;
+    canvas = null; // งานเบื้องหลังเป็นเจ้าของต่อ
+    view.started();
+    enqueue(async () => {
+      const fresh = await db.get('pages', pageId);
+      await buildPage(docId, src, { ...res, preview: null, erase, needsReview: false }, fresh);
+      await refreshDoc(await db.get('docs', docId));
+    })
+      .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message, { ms: 5000 }))
+      .finally(() => { freeCanvas(src); view.finished(); });
+  } catch (err) {
+    console.error(err);
+    toast('ทำรายการไม่สำเร็จ: ' + (err?.message || err), { ms: 5000 });
   } finally {
-    loading.close();
-  }
-  const strokes = await openEraser({ image: base, strokes: page.erase || [] });
-  freeCanvas(base);
-  if (!strokes) return;
-  const prog = progress('กำลังบันทึก…');
-  try {
-    const c = await loadOriginal(page);
-    await buildPage(doc.id, c, { ...pageLook(page), erase: strokes }, page);
-    freeCanvas(c);
-    await refreshDoc(doc);
-  } finally {
-    prog.close();
+    freeCanvas(canvas);
+    flowOpen = false;
   }
 }
 
-async function reEditPage(doc, page) {
-  const loading = progress('กำลังเปิดภาพ…');
-  let canvas;
+/** ลบข้อความ: ระบายเสร็จแสดงผลทันที คำนวณภาพจริงจากต้นฉบับเบื้องหลัง */
+async function erasePageFlow(docId, pageId, view) {
+  if (flowOpen) return;
+  flowOpen = true;
+  let base = null;
   try {
-    canvas = await loadOriginal(page);
-  } finally {
-    loading.close();
-  }
-  try {
-    const res = await openEditor({ canvas, ...pageLook(page) });
-    if (!res) return;
-    let erase = page.erase || [];
-    if (erase.length) {
-      const same = JSON.stringify([res.corners, res.straighten]) === JSON.stringify([page.corners, page.straighten ?? false]);
-      if (same) erase = rotateStrokes(erase, (res.rotation || 0) - (page.rotation || 0));
-      else { erase = []; toast('ล้างรอยลบข้อความแล้ว เพราะเปลี่ยนขอบภาพ', { ms: 4000 }); }
-    }
-    const prog = progress('กำลังบันทึก…');
+    const spin = progress('กำลังเปิดภาพ…');
+    let p;
     try {
-      await buildPage(doc.id, canvas, { ...res, erase }, page);
-      await refreshDoc(doc);
+      await queue;
+      p = await db.get('pages', pageId);
+      // ภาพฐานที่ยังไม่มีรอยลบ (รอยเดิมแก้/ย้อนกลับได้)
+      if (p.erase?.length) {
+        const c = await loadOriginal(p);
+        base = await processCanvas(c, { ...pageLook(p), erase: [] });
+        freeCanvas(c);
+      } else {
+        base = await loadCanvas(p.processed, Infinity);
+      }
     } finally {
-      prog.close();
+      spin.close();
     }
+    const strokes = await openEraser({ image: base, strokes: p.erase || [] });
+    if (!strokes) return;
+    drawStrokes(base.getContext('2d'), base.width, base.height, strokes);
+    view.showPreview(base);
+    base = null;
+    view.started();
+    enqueue(async () => {
+      const fresh = await db.get('pages', pageId);
+      const c = await loadOriginal(fresh);
+      await buildPage(docId, c, { ...pageLook(fresh), erase: strokes }, fresh);
+      freeCanvas(c);
+      await refreshDoc(await db.get('docs', docId));
+    })
+      .catch((err) => toast('บันทึกไม่สำเร็จ: ' + err.message, { ms: 5000 }))
+      .finally(() => view.finished());
+  } catch (err) {
+    console.error(err);
+    toast('ทำรายการไม่สำเร็จ: ' + (err?.message || err), { ms: 5000 });
   } finally {
-    freeCanvas(canvas);
+    freeCanvas(base);
+    flowOpen = false;
   }
 }
 

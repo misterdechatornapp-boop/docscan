@@ -1,7 +1,7 @@
 // หน้าปรับภาพ 2 ขั้น: (1) ลากมุมให้ตรงขอบกระดาษ (2) เลือกฟิลเตอร์ + หมุน
 import { icon } from './icons.js';
 import { esc } from './ui.js';
-import { detectPage, processCanvas, scaleCanvas, freeCanvas, FULL_FRAME } from './imaging.js';
+import { detectPage, imageSource, scaleCanvas, freeCanvas, FULL_FRAME } from './imaging.js';
 
 /** ค่าปรับภาพเริ่มต้น (ปุ่ม "ค่าเริ่มต้น") */
 export const DEFAULT_LOOK = { contrast: 0.5, brightness: 0, sharpness: 0.3 };
@@ -33,10 +33,12 @@ let adjustOpen = false;
  * @param {number} [o.brightness] −1..1
  * @param {number} [o.sharpness] 0..1
  * @param {boolean} [o.straighten] ดัดเส้นตาราง/บรรทัดที่โค้งให้ตรง
+ * @param {boolean} [o.fillEdges] เติมขอบที่แหว่ง/พื้นหลังที่ติดมาด้วยสีกระดาษ
  * @param {Function} [o.onContinue] ถ้ามี จะมีปุ่ม "บันทึก + ถ่ายต่อ" (เรียกทันทีในจังหวะแตะ เพื่อให้ iOS ยอมเปิดกล้อง)
- * @returns {Promise<{corners, filter, rotation, contrast, brightness, sharpness, straighten, cont}|null>}
+ * @returns {Promise<{corners, filter, rotation, contrast, brightness, sharpness, straighten, fillEdges, cont, preview}|null>}
+ *   preview = ภาพพรีวิวล่าสุด (canvas) ใช้แสดงทันทีระหว่างบันทึกภาพจริงเบื้องหลัง · ผู้เรียกต้อง freeCanvas เอง
  */
-export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0.5, brightness = 0, sharpness = DEFAULT_LOOK.sharpness, straighten = false, onContinue }) {
+export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0.5, brightness = 0, sharpness = DEFAULT_LOOK.sharpness, straighten = false, fillEdges = true, onContinue }) {
   const look = { contrast, brightness, sharpness };
   const dlg = document.createElement('dialog');
   dlg.className = 'editor';
@@ -76,6 +78,7 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
         </div>
         <div class="ed-chips">
           <button type="button" class="chip chip-toggle" data-act="straighten" aria-pressed="${straighten}">${icon('lines')}ดัดเส้นให้ตรง</button>
+          <button type="button" class="chip chip-toggle" data-act="fillEdges" aria-pressed="${fillEdges}">${icon('fill')}เติมขอบ</button>
           <button type="button" class="chip chip-toggle" data-act="adjust" aria-pressed="${adjustOpen}">${icon('sliders')}ปรับแสง</button>
           ${onContinue ? `<button type="button" class="chip chip-icon chip-accent" data-act="saveMore">${icon('camera')}บันทึก+ถ่ายต่อ</button>` : ''}
         </div>
@@ -107,13 +110,15 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
     rotation,
     ...look,
     straighten,
+    fillEdges,
   };
 
   // ภาพสำหรับแสดงบนจอ (ย่อให้พอดีจอ เพื่อความลื่น)
   const display = scaleCanvas(canvas, Math.max(window.innerWidth, window.innerHeight) * Math.min(2, devicePixelRatio || 1));
   display.className = 'ed-img';
   frame.prepend(display);
-  let previewSrc = null;
+  let source = null;        // ภาพต้นทางของพรีวิว ส่งให้ตัวประมวลผลครั้งเดียว
+  let shownLook = null;     // ค่าปรับแสงของภาพพรีวิวที่แสดงอยู่ (ใช้ทำพรีวิวทันทีระหว่างลากแถบ)
 
   function layout() {
     const r = stage.getBoundingClientRect();
@@ -241,25 +246,62 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
 
   /* ----- ขั้นที่ 2: พรีวิวฟิลเตอร์ ----- */
   let previewToken = 0;
+  let spinTimer;
+  let closed = false;
+  let adjTimer;
   async function renderPreview() {
+    if (closed) return;
     const token = ++previewToken;
-    previewBox.classList.add('loading');
+    // ไม่หรี่ภาพเดิม · ขึ้นวงหมุนเล็ก ๆ เฉพาะเมื่อรอนานเกิน 300 ms
+    clearTimeout(spinTimer);
+    spinTimer = setTimeout(() => previewBox.classList.add('loading'), 300);
     dlg.querySelectorAll('[data-filter]').forEach((b) => b.classList.toggle('active', b.dataset.filter === state.filter));
     try {
-      if (!previewSrc) previewSrc = scaleCanvas(canvas, 1400);
-      const out = await processCanvas(previewSrc, state);
-      if (token !== previewToken) { freeCanvas(out); return; }
+      if (!source) {
+        const src = scaleCanvas(canvas, 1100);
+        source = imageSource(src);
+        source.canvas = src;
+      }
+      const look = { ...state };
+      const out = await source.process(look);
+      if (token !== previewToken || closed) { freeCanvas(out); return; }
       out.className = 'ed-preview-img';
       const old = previewBox.querySelector('canvas');
       if (old) { old.replaceWith(out); freeCanvas(old); } else previewBox.appendChild(out);
+      shownLook = look;
+      liveAdjust();
     } catch (err) {
       console.error(err);
     } finally {
-      if (token === previewToken) previewBox.classList.remove('loading');
+      if (token === previewToken) {
+        clearTimeout(spinTimer);
+        previewBox.classList.remove('loading');
+      }
     }
   }
 
+  /** ระหว่างลากแถบปรับแสง: ปรับภาพที่แสดงอยู่ด้วย CSS ทันที แล้วค่อยแทนด้วยผลจริง */
+  function liveAdjust() {
+    const c = previewBox.querySelector('canvas');
+    if (!c || !shownLook) return;
+    const db = state.brightness - shownLook.brightness;
+    const dc = state.contrast - shownLook.contrast;
+    c.style.filter = Math.abs(db) + Math.abs(dc) < 0.005 ? '' : `brightness(${1 + db * 0.6}) contrast(${1 + dc * 1.4})`;
+  }
+
   const result = () => ({ ...state, corners: state.corners.map((p) => [...p]), mids: null });
+
+  /** ภาพพรีวิวล่าสุด (ถ้าตรงกับค่าที่บันทึก) ส่งให้ผู้เรียกแสดงทันที */
+  function takePreview() {
+    const c = previewBox.querySelector('canvas');
+    if (!c || !shownLook) return null;
+    const same = ['filter', 'rotation', 'contrast', 'brightness', 'straighten', 'fillEdges'].every((k) => shownLook[k] === state[k])
+      && JSON.stringify(shownLook.corners) === JSON.stringify(state.corners);
+    if (!same) return null;
+    c.remove();
+    c.style.filter = '';
+    return c;
+  }
 
   function showStep(n) {
     dlg.querySelectorAll('.ed-step').forEach((s) => { s.hidden = s.dataset.step !== String(n); });
@@ -273,10 +315,15 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      closed = true;
+      clearTimeout(adjTimer);
+      clearTimeout(spinTimer);
       window.removeEventListener('resize', layout);
       if (dlg.open) dlg.close();
       freeCanvas(display);
-      freeCanvas(previewSrc);
+      source?.drop();
+      freeCanvas(source?.canvas);
+      previewBox.querySelectorAll('canvas').forEach(freeCanvas);
       dlg.remove();
       resolve(value);
     };
@@ -299,18 +346,26 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
         Object.assign(state, DEFAULT_LOOK);
         syncAdjust();
         renderPreview();
-      } else if (act === 'straighten') {
-        state.straighten = !state.straighten;
-        btn.setAttribute('aria-pressed', String(state.straighten));
+      } else if (act === 'straighten' || act === 'fillEdges') {
+        state[act] = !state[act];
+        btn.setAttribute('aria-pressed', String(state[act]));
         renderPreview();
       }
-      else if (act === 'rotL') { state.rotation = (state.rotation + 270) % 360; renderPreview(); }
-      else if (act === 'rotR') { state.rotation = (state.rotation + 90) % 360; renderPreview(); }
-      else if (act === 'save') finish({ ...result(), cont: false });
-      else if (act === 'saveMore') { onContinue(); finish({ ...result(), cont: true }); }
+      else if (act === 'rotL' || act === 'rotR') {
+        const d = act === 'rotL' ? -90 : 90;
+        state.rotation = (state.rotation + 360 + d) % 360;
+        // หมุนภาพที่แสดงอยู่ทันที แล้วแทนด้วยผลจริงเมื่อเสร็จ
+        const c = previewBox.querySelector('canvas');
+        if (c) {
+          c.dataset.turn = String((Number(c.dataset.turn) || 0) + d);
+          c.style.rotate = `${c.dataset.turn}deg`;
+        }
+        renderPreview();
+      }
+      else if (act === 'save') finish({ ...result(), cont: false, preview: takePreview() });
+      else if (act === 'saveMore') { onContinue(); finish({ ...result(), cont: true, preview: takePreview() }); }
     });
     // ลากแถบปรับภาพ: รอให้หยุดลากสักนิดค่อยคำนวณพรีวิวใหม่
-    let adjTimer;
     const syncAdjust = () => ADJUST.forEach((a) => {
       const input = dlg.querySelector(`#adj-${a.key}`);
       input.value = Math.round(state[a.key] * a.scale);
@@ -322,8 +377,9 @@ export function openEditor({ canvas, corners, filter, rotation = 0, contrast = 0
       const a = ADJUST.find((x) => x.key === key);
       state[key] = Number(e.target.value) / a.scale;
       e.target.nextElementSibling.textContent = e.target.value;
+      liveAdjust();
       clearTimeout(adjTimer);
-      adjTimer = setTimeout(renderPreview, 160);
+      adjTimer = setTimeout(renderPreview, 220);
     });
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
     dlg.addEventListener('close', () => finish(null));
